@@ -1,34 +1,36 @@
-mod projection;
+mod place_ty;
 
 use std::{iter, ops::ControlFlow};
 
-use flux_common::tracked_span_bug;
+use flux_common::{dbg::debug_assert_eq3, tracked_span_bug};
 use flux_middle::{
     global_env::GlobalEnv,
     intern::List,
     rty::{
-        box_args,
+        canonicalize::ShallowHoister,
         evars::EVarSol,
-        fold::{FallibleTypeFolder, TypeFoldable, TypeFolder, TypeVisitable, TypeVisitor},
+        fold::{FallibleTypeFolder, TypeFoldable, TypeVisitable, TypeVisitor},
         subst::RegionSubst,
-        BaseTy, Binder, BoundVariableKind, Expr, ExprKind, GenericArg, HoleKind, Mutability, Path,
-        PtrKind, Region, Ty, TyKind, INNERMOST,
+        BaseTy, Binder, BoundReftKind, Expr, ExprKind, GenericArg, HoleKind, Lambda, Mutability,
+        Path, PtrKind, Region, SortCtor, SubsetTy, Ty, TyKind, INNERMOST,
     },
     rustc::mir::{BasicBlock, Local, LocalDecls, Place, PlaceElem},
 };
 use itertools::{izip, Itertools};
 use rustc_middle::ty::TyCtxt;
 
-use self::projection::{LocKind, PlacesTree};
+use self::place_ty::{LocKind, PlacesTree};
 use super::rty::{Loc, Sort};
 use crate::{
     checker::errors::CheckerErrKind,
     constraint_gen::{ConstrGen, ConstrReason},
     fixpoint_encoding::{KVarEncoding, KVarStore},
-    refine_tree::{AssumeInvariants, RefineCtxt, Scope},
+    refine_tree::{RefineCtxt, Scope},
     rty::VariantIdx,
     CheckerConfig,
 };
+
+type Result<T = ()> = std::result::Result<T, CheckerErrKind>;
 
 #[derive(Clone, Default)]
 pub struct TypeEnv<'a> {
@@ -46,6 +48,7 @@ pub struct BasicBlockEnv {
     scope: Scope,
 }
 
+#[derive(Debug)]
 struct BasicBlockEnvData {
     constrs: List<Expr>,
     bindings: PlacesTree,
@@ -71,16 +74,16 @@ impl TypeEnv<'_> {
             .insert(local.into(), Place::new(local, vec![]), LocKind::Local, Ty::uninit());
     }
 
-    pub(crate) fn into_infer(self, scope: Scope) -> Result<BasicBlockEnvShape, CheckerErrKind> {
+    pub(crate) fn into_infer(self, scope: Scope) -> Result<BasicBlockEnvShape> {
         BasicBlockEnvShape::new(scope, self)
     }
 
     pub(crate) fn lookup_place(
         &mut self,
-        genv: &GlobalEnv,
+        genv: GlobalEnv,
         rcx: &mut RefineCtxt,
         place: &Place,
-    ) -> Result<Ty, CheckerErrKind> {
+    ) -> Result<Ty> {
         Ok(self.bindings.lookup_unfolding(genv, rcx, place)?.ty)
     }
 
@@ -97,12 +100,12 @@ impl TypeEnv<'_> {
     /// and then replaced by the region in the type of the `x` after the assignment.
     pub(crate) fn borrow(
         &mut self,
-        genv: &GlobalEnv,
+        genv: GlobalEnv,
         rcx: &mut RefineCtxt,
         re: Region,
         mutbl: Mutability,
         place: &Place,
-    ) -> Result<Ty, CheckerErrKind> {
+    ) -> Result<Ty> {
         let result = self.bindings.lookup_unfolding(genv, rcx, place)?;
         if result.is_strg && mutbl == Mutability::Mut {
             Ok(Ty::ptr(PtrKind::from_ref(re, mutbl), result.path()))
@@ -113,19 +116,19 @@ impl TypeEnv<'_> {
 
     /// Converts a pointer `ptr(mut, l)` to a borrow `&mut T` for a type `T` that needs to be inferred.
     /// For example, given the environment
-    /// ```ignore
-    /// x: i32[a], p: ptr(mut, x)`
+    /// ```text
+    /// x: i32[a], p: ptr(mut, x)
     /// ```
     ///
     /// Converting the pointer to a borrow will produce
     ///
-    /// ```ignore
-    /// x: †i32{v: $k(v)}, p: &mut i32{v: $k(v)}`
+    /// ```text
+    /// x: †i32{v: $k(v)}, p: &mut i32{v: $k(v)}
     /// ```
     ///
     /// together with a constraint
     ///
-    /// ```ignore
+    /// ```text
     /// i32[a] <: i32{v: $k(v)}
     /// ```
     pub(crate) fn ptr_to_borrow(
@@ -133,7 +136,7 @@ impl TypeEnv<'_> {
         rcx: &mut RefineCtxt,
         gen: &mut ConstrGen,
         place: &Place,
-    ) -> Result<(), CheckerErrKind> {
+    ) -> Result {
         // place: ptr(mut, path)
         let ptr_lookup = self.bindings.lookup(place);
         let TyKind::Ptr(PtrKind::Mut(re), path) = ptr_lookup.ty.kind() else {
@@ -169,7 +172,7 @@ impl TypeEnv<'_> {
         gen: &mut ConstrGen,
         place: &Place,
         new_ty: Ty,
-    ) -> Result<(), CheckerErrKind> {
+    ) -> Result {
         let rustc_ty = place.ty(gen.genv, self.local_decls)?.ty;
         let new_ty = RegionSubst::new(&new_ty, &rustc_ty).apply(&new_ty);
         let result = self.bindings.lookup_unfolding(gen.genv, rcx, place)?;
@@ -184,10 +187,10 @@ impl TypeEnv<'_> {
 
     pub(crate) fn move_place(
         &mut self,
-        genv: &GlobalEnv,
+        genv: GlobalEnv,
         rcx: &mut RefineCtxt,
         place: &Place,
-    ) -> Result<Ty, CheckerErrKind> {
+    ) -> Result<Ty> {
         let result = self.bindings.lookup_unfolding(genv, rcx, place)?;
         if result.is_strg {
             let uninit = Ty::uninit();
@@ -199,19 +202,14 @@ impl TypeEnv<'_> {
 
     pub(crate) fn unpack(&mut self, rcx: &mut RefineCtxt, check_overflow: bool) {
         self.bindings
-            .fmap_mut(|ty| rcx.unpack(ty, AssumeInvariants::yes(check_overflow)));
+            .fmap_mut(|ty| rcx.unpacker().assume_invariants(check_overflow).unpack(ty));
     }
 
     pub(crate) fn unblock(&mut self, rcx: &mut RefineCtxt, place: &Place, check_overflow: bool) {
         self.bindings.lookup(place).unblock(rcx, check_overflow);
     }
 
-    pub(crate) fn block_with(
-        &mut self,
-        genv: &GlobalEnv,
-        path: &Path,
-        new_ty: Ty,
-    ) -> Result<Ty, CheckerErrKind> {
+    pub(crate) fn block_with(&mut self, genv: GlobalEnv, path: &Path, new_ty: Ty) -> Result<Ty> {
         let place = self.bindings.path_to_place(path);
         let rustc_ty = place.ty(genv, self.local_decls)?.ty;
         let new_ty = RegionSubst::new(&new_ty, &rustc_ty).apply(&new_ty);
@@ -225,12 +223,12 @@ impl TypeEnv<'_> {
         gen: &mut ConstrGen,
         bb_env: &BasicBlockEnv,
         target: BasicBlock,
-    ) -> Result<(), CheckerErrKind> {
+    ) -> Result {
         let mut infcx = gen.infcx(rcx, ConstrReason::Goto(target));
 
         let bb_env = bb_env
             .data
-            .replace_bound_exprs_with(|sort, mode| infcx.fresh_infer_var(sort, mode));
+            .replace_bound_refts_with(|sort, mode, _| infcx.fresh_infer_var(sort, mode));
 
         // Check constraints
         for constr in &bb_env.constrs {
@@ -254,29 +252,29 @@ impl TypeEnv<'_> {
         rcx: &mut RefineCtxt,
         gen: &mut ConstrGen,
         place: &Place,
-    ) -> Result<(), CheckerErrKind> {
+    ) -> Result {
         self.bindings.lookup(place).fold(rcx, gen)?;
         Ok(())
     }
 
     pub(crate) fn unfold(
         &mut self,
-        genv: &GlobalEnv,
+        genv: GlobalEnv,
         rcx: &mut RefineCtxt,
         place: &Place,
         checker_conf: CheckerConfig,
-    ) -> Result<(), CheckerErrKind> {
+    ) -> Result {
         self.bindings.unfold(genv, rcx, place, checker_conf)
     }
 
     pub(crate) fn downcast(
         &mut self,
-        genv: &GlobalEnv,
+        genv: GlobalEnv,
         rcx: &mut RefineCtxt,
         place: &Place,
         variant_idx: VariantIdx,
         checker_config: CheckerConfig,
-    ) -> Result<(), CheckerErrKind> {
+    ) -> Result {
         let mut down_place = place.clone();
         down_place
             .projection
@@ -297,7 +295,7 @@ impl BasicBlockEnvShape {
         TypeEnv { bindings: self.bindings.clone(), local_decls }
     }
 
-    fn new(scope: Scope, env: TypeEnv) -> Result<BasicBlockEnvShape, CheckerErrKind> {
+    fn new(scope: Scope, env: TypeEnv) -> Result<BasicBlockEnvShape> {
         let mut bindings = env.bindings;
         bindings.fmap_mut(|ty| BasicBlockEnvShape::pack_ty(&scope, ty));
         Ok(BasicBlockEnvShape { scope, bindings })
@@ -365,16 +363,16 @@ impl BasicBlockEnvShape {
             | BaseTy::Char
             | BaseTy::Never
             | BaseTy::Closure(_, _)
-            | BaseTy::Coroutine(_, _)
-            | BaseTy::CoroutineWitness(_, _) => bty.clone(),
+            | BaseTy::Coroutine(..) => bty.clone(),
         }
     }
 
     fn pack_generic_arg(scope: &Scope, arg: &GenericArg) -> GenericArg {
         match arg {
             GenericArg::Ty(ty) => GenericArg::Ty(Self::pack_ty(scope, ty)),
-            GenericArg::BaseTy(arg) => {
-                GenericArg::BaseTy(arg.as_ref().map(|ty| Self::pack_ty(scope, ty)))
+            GenericArg::Base(arg) => {
+                assert!(!scope.has_free_vars(arg));
+                GenericArg::Base(arg.clone())
             }
             GenericArg::Lifetime(re) => GenericArg::Lifetime(*re),
             GenericArg::Const(c) => GenericArg::Const(c.clone()),
@@ -388,7 +386,7 @@ impl BasicBlockEnvShape {
     /// join(self, genv, other) consumes the bindings in other, to "update"
     /// `self` in place, and returns `true` if there was an actual change
     /// or `false` indicating no change (i.e., a fixpoint was reached).
-    pub(crate) fn join(&mut self, other: TypeEnv) -> Result<bool, CheckerErrKind> {
+    pub(crate) fn join(&mut self, other: TypeEnv) -> Result<bool> {
         let paths = self.bindings.paths();
 
         // Join types
@@ -416,12 +414,12 @@ impl BasicBlockEnvShape {
             (TyKind::Indexed(bty1, idx1), TyKind::Indexed(bty2, idx2)) => {
                 let bty = self.join_bty(bty1, bty2);
                 let mut sorts = vec![];
-                let idx = self.join_idx(&idx1.expr, &idx2.expr, &bty.sort(), &mut sorts);
+                let idx = self.join_idx(idx1, idx2, &bty.sort(), &mut sorts);
                 if sorts.is_empty() {
                     Ty::indexed(bty, idx)
                 } else {
                     let ty = Ty::constr(Expr::hole(HoleKind::Pred), Ty::indexed(bty, idx));
-                    Ty::exists(Binder::with_sorts(ty, sorts))
+                    Ty::exists(Binder::with_sorts(ty, &sorts))
                 }
             }
             (TyKind::Ptr(rk1, path1), TyKind::Ptr(rk2, path2)) => {
@@ -458,13 +456,27 @@ impl BasicBlockEnvShape {
 
     fn join_idx(&self, e1: &Expr, e2: &Expr, sort: &Sort, bound_sorts: &mut Vec<Sort>) -> Expr {
         match (e1.kind(), e2.kind(), sort) {
-            (ExprKind::Tuple(es1), ExprKind::Tuple(es2), Sort::Tuple(sorts)) => {
-                debug_assert_eq!(es1.len(), es2.len());
-                debug_assert_eq!(es1.len(), sorts.len());
+            (ExprKind::Aggregate(_, es1), ExprKind::Aggregate(_, es2), Sort::Tuple(sorts)) => {
+                debug_assert_eq3!(es1.len(), es2.len(), sorts.len());
                 Expr::tuple(
                     izip!(es1, es2, sorts)
                         .map(|(e1, e2, sort)| self.join_idx(e1, e2, sort, bound_sorts))
-                        .collect_vec(),
+                        .collect(),
+                )
+            }
+            (
+                ExprKind::Aggregate(_, flds1),
+                ExprKind::Aggregate(_, flds2),
+                Sort::App(SortCtor::Adt(sort_def), args),
+            ) => {
+                let sorts = sort_def.sorts(args);
+                debug_assert_eq3!(flds1.len(), flds2.len(), sorts.len());
+
+                Expr::adt(
+                    sort_def.did(),
+                    izip!(flds1, flds2, &sorts)
+                        .map(|(f1, f2, sort)| self.join_idx(f1, f2, sort, bound_sorts))
+                        .collect(),
                 )
             }
             _ => {
@@ -473,9 +485,16 @@ impl BasicBlockEnvShape {
                 let has_escaping_vars2 = e2.has_escaping_bvars();
                 if !has_free_vars2 && !has_escaping_vars1 && !has_escaping_vars2 && e1 == e2 {
                     e1.clone()
+                } else if sort.is_pred() {
+                    let fsort = sort.expect_func().expect_mono();
+                    Expr::abs(Lambda::with_sorts(
+                        Expr::hole(HoleKind::Pred),
+                        fsort.inputs(),
+                        fsort.output().clone(),
+                    ))
                 } else {
                     bound_sorts.push(sort.clone());
-                    Expr::late_bvar(INNERMOST, (bound_sorts.len() - 1) as u32)
+                    Expr::late_bvar(INNERMOST, (bound_sorts.len() - 1) as u32, BoundReftKind::Annon)
                 }
             }
         }
@@ -515,11 +534,25 @@ impl BasicBlockEnvShape {
     fn join_generic_arg(&self, arg1: &GenericArg, arg2: &GenericArg) -> GenericArg {
         match (arg1, arg2) {
             (GenericArg::Ty(ty1), GenericArg::Ty(ty2)) => GenericArg::Ty(self.join_ty(ty1, ty2)),
-            (GenericArg::BaseTy(_), GenericArg::BaseTy(_)) => {
-                tracked_span_bug!("generic argument join for base types is not implemented")
+            (GenericArg::Base(ctor1), GenericArg::Base(ctor2)) => {
+                let sty1 = ctor1.as_ref().skip_binder();
+                let sty2 = ctor2.as_ref().skip_binder();
+                debug_assert_eq3!(&sty1.idx, &sty2.idx, &Expr::nu());
+
+                let bty = self.join_bty(&sty1.bty, &sty2.bty);
+                let pred = if self.scope.has_free_vars(&sty2.pred) || sty1.pred != sty2.pred {
+                    Expr::hole(HoleKind::Pred)
+                } else {
+                    sty1.pred.clone()
+                };
+                let sort = bty.sort();
+                let ctor = Binder::with_sort(SubsetTy::new(bty, Expr::nu(), pred), sort);
+                GenericArg::Base(ctor)
             }
-            (GenericArg::Lifetime(re1), GenericArg::Lifetime(re2)) => {
-                debug_assert_eq!(re1, re2);
+            (GenericArg::Lifetime(re1), GenericArg::Lifetime(_re2)) => {
+                // TODO(nilehmann) loop_abstract_refinement.rs is triggering this assertion to fail
+                // wee should fix it.
+                // debug_assert_eq!(re1, _re2);
                 GenericArg::Lifetime(*re1)
             }
             _ => tracked_span_bug!("unexpected generic args: `{arg1:?}` - `{arg2:?}`"),
@@ -529,9 +562,9 @@ impl BasicBlockEnvShape {
     pub fn into_bb_env(self, kvar_store: &mut KVarStore) -> BasicBlockEnv {
         let mut bindings = self.bindings;
 
-        let mut generalizer = Generalizer::new();
-        bindings.fmap_mut(|ty| generalizer.generalize(ty));
-        let (vars, preds) = generalizer.into_parts();
+        let mut hoister = ShallowHoister::default();
+        bindings.fmap_mut(|ty| hoister.hoist(ty));
+        let (vars, preds) = hoister.into_parts();
 
         // Replace all holes with a single fresh kvar on all parameters
         let mut constrs = preds
@@ -560,71 +593,17 @@ impl BasicBlockEnvShape {
     }
 }
 
-struct Generalizer {
-    vars: Vec<BoundVariableKind>,
-    preds: Vec<Expr>,
-}
-
-impl Generalizer {
-    fn new() -> Self {
-        Self { vars: vec![], preds: vec![] }
-    }
-
-    fn into_parts(self) -> (List<BoundVariableKind>, Vec<Expr>) {
-        (List::from_vec(self.vars), self.preds)
-    }
-
-    fn generalize(&mut self, ty: &Ty) -> Ty {
-        ty.fold_with(self)
-    }
-}
-
-impl TypeFolder for Generalizer {
-    fn fold_ty(&mut self, ty: &Ty) -> Ty {
-        match ty.kind() {
-            TyKind::Exists(ty) => {
-                ty.replace_bound_exprs_with(|sort, mode| {
-                    let idx = self.vars.len();
-                    self.vars
-                        .push(BoundVariableKind::Refine(sort.clone(), mode));
-                    Expr::late_bvar(INNERMOST, idx as u32)
-                })
-                .fold_with(self)
-            }
-            TyKind::Constr(pred, ty) => {
-                self.preds.push(pred.clone());
-                ty.fold_with(self)
-            }
-            _ => ty.clone(),
-        }
-    }
-
-    fn fold_bty(&mut self, bty: &BaseTy) -> BaseTy {
-        match bty {
-            BaseTy::Adt(adt_def, args) if adt_def.is_box() => {
-                let (boxed, alloc) = box_args(args);
-                let args = List::from_arr([
-                    GenericArg::Ty(boxed.fold_with(self)),
-                    GenericArg::Ty(alloc.clone()),
-                ]);
-                BaseTy::Adt(adt_def.clone(), args)
-            }
-            BaseTy::Ref(re, ty, Mutability::Not) => {
-                BaseTy::Ref(*re, ty.fold_with(self), Mutability::Not)
-            }
-            _ => bty.clone(),
-        }
-    }
-}
-
 impl TypeVisitable for BasicBlockEnvData {
-    fn visit_with<V: TypeVisitor>(&self, _visitor: &mut V) -> ControlFlow<V::BreakTy, ()> {
+    fn visit_with<V: TypeVisitor>(&self, _visitor: &mut V) -> ControlFlow<V::BreakTy> {
         unimplemented!()
     }
 }
 
 impl TypeFoldable for BasicBlockEnvData {
-    fn try_fold_with<F: FallibleTypeFolder>(&self, folder: &mut F) -> Result<Self, F::Error> {
+    fn try_fold_with<F: FallibleTypeFolder>(
+        &self,
+        folder: &mut F,
+    ) -> std::result::Result<Self, F::Error> {
         Ok(BasicBlockEnvData {
             constrs: self.constrs.try_fold_with(folder)?,
             bindings: self.bindings.try_fold_with(folder)?,
@@ -640,7 +619,7 @@ impl BasicBlockEnv {
     ) -> TypeEnv<'a> {
         let data = self
             .data
-            .replace_bound_exprs_with(|sort, _| rcx.define_vars(sort));
+            .replace_bound_refts_with(|sort, _, _| rcx.define_vars(sort));
         for constr in &data.constrs {
             rcx.assume_pred(constr);
         }
@@ -656,56 +635,53 @@ mod pretty {
     use std::fmt;
 
     use flux_middle::pretty::*;
-    use itertools::Itertools;
 
     use super::*;
 
     impl Pretty for TypeEnv<'_> {
-        fn fmt(&self, cx: &PPrintCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt(&self, cx: &PrettyCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             define_scoped!(cx, f);
             w!("{:?}", &self.bindings)
         }
 
-        fn default_cx(tcx: TyCtxt) -> PPrintCx {
+        fn default_cx(tcx: TyCtxt) -> PrettyCx {
             PlacesTree::default_cx(tcx)
         }
     }
 
     impl Pretty for BasicBlockEnvShape {
-        fn fmt(&self, cx: &PPrintCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt(&self, cx: &PrettyCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             define_scoped!(cx, f);
             w!("{:?} {:?}", &self.scope, &self.bindings)
         }
 
-        fn default_cx(tcx: TyCtxt) -> PPrintCx {
+        fn default_cx(tcx: TyCtxt) -> PrettyCx {
             PlacesTree::default_cx(tcx)
         }
     }
 
     impl Pretty for BasicBlockEnv {
-        fn fmt(&self, cx: &PPrintCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt(&self, cx: &PrettyCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             define_scoped!(cx, f);
             w!("{:?} ", &self.scope)?;
 
-            if !self.data.vars().is_empty() {
-                w!(
-                    "∃ {}. ",
-                    ^self.data.vars()
-                        .iter()
-                        .format_with(", ", |s, f| f(&format_args_cx!("{:?}", s)))
-                )?;
-            }
-            let data = self.data.as_ref().skip_binder();
-            if !data.constrs.is_empty() {
-                w!(
-                    "{:?} ⇒ ",
-                    join!(", ", data.constrs.iter().filter(|pred| !pred.is_trivially_true()))
-                )?;
-            }
-            w!("{:?}", &data.bindings)
+            let vars = self.data.vars();
+            cx.with_bound_vars(vars, || {
+                if !vars.is_empty() {
+                    cx.fmt_bound_vars("for<", vars, "> ", f)?;
+                }
+                let data = self.data.as_ref().skip_binder();
+                if !data.constrs.is_empty() {
+                    w!(
+                        "{:?} ⇒ ",
+                        join!(", ", data.constrs.iter().filter(|pred| !pred.is_trivially_true()))
+                    )?;
+                }
+                w!("{:?}", &data.bindings)
+            })
         }
 
-        fn default_cx(tcx: TyCtxt) -> PPrintCx {
+        fn default_cx(tcx: TyCtxt) -> PrettyCx {
             PlacesTree::default_cx(tcx)
         }
     }

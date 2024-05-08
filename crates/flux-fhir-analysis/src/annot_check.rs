@@ -7,60 +7,122 @@
 //! [`fhir`]: flux_middle::fhir
 use std::iter;
 
-use flux_common::{bug, iter::IterExt};
+use flux_common::{bug, index::IndexGen, iter::IterExt, span_bug};
 use flux_errors::ErrorGuaranteed;
 use flux_middle::{
     fhir::{
         self,
         lift::{self, LiftCtxt},
-        Res, WfckResults,
+        ExprRes, Res,
     },
     global_env::GlobalEnv,
+    rty::WfckResults,
 };
 use rustc_data_structures::unord::UnordMap;
-use rustc_errors::IntoDiagnostic;
+use rustc_errors::Diagnostic;
 use rustc_hir::OwnerId;
 
-pub fn check_fn_sig(
-    genv: &GlobalEnv,
-    wfckresults: &mut WfckResults,
+pub(crate) fn check_node<'genv>(
+    genv: GlobalEnv<'genv, '_>,
+    wfckresults: &mut WfckResults<'genv>,
+    node: &fhir::Node,
+) -> Result<(), ErrorGuaranteed> {
+    match node {
+        fhir::Node::Item(item) => check_item(genv, wfckresults, item),
+        fhir::Node::TraitItem(trait_item) => check_trait_item(genv, wfckresults, trait_item),
+        fhir::Node::ImplItem(impl_item) => check_impl_item(genv, wfckresults, impl_item),
+    }
+}
+
+fn check_item<'genv>(
+    genv: GlobalEnv<'genv, '_>,
+    wfckresults: &mut WfckResults<'genv>,
+    item: &fhir::Item,
+) -> Result<(), ErrorGuaranteed> {
+    match &item.kind {
+        fhir::ItemKind::Enum(enum_def) => {
+            check_enum_def(genv, wfckresults, item.owner_id, enum_def)
+        }
+        fhir::ItemKind::Struct(struct_def) => {
+            check_struct_def(genv, wfckresults, item.owner_id, struct_def)
+        }
+        fhir::ItemKind::Fn(fn_sig) => check_fn_sig(genv, wfckresults, item.owner_id, fn_sig),
+        fhir::ItemKind::TyAlias(ty_alias) => {
+            check_ty_alias(genv, wfckresults, item.owner_id, ty_alias)
+        }
+        fhir::ItemKind::Trait(_) | fhir::ItemKind::Impl(_) | fhir::ItemKind::OpaqueTy(_) => Ok(()),
+    }
+}
+
+fn check_trait_item<'genv>(
+    genv: GlobalEnv<'genv, '_>,
+    wfckresults: &mut WfckResults<'genv>,
+    trait_item: &fhir::TraitItem,
+) -> Result<(), ErrorGuaranteed> {
+    match &trait_item.kind {
+        fhir::TraitItemKind::Fn(fn_sig) => {
+            check_fn_sig(genv, wfckresults, trait_item.owner_id, fn_sig)
+        }
+        fhir::TraitItemKind::Type(_) => Ok(()),
+    }
+}
+
+fn check_impl_item<'genv>(
+    genv: GlobalEnv<'genv, '_>,
+    wfckresults: &mut WfckResults<'genv>,
+    impl_item: &fhir::ImplItem,
+) -> Result<(), ErrorGuaranteed> {
+    match &impl_item.kind {
+        fhir::ImplItemKind::Fn(fn_sig) => {
+            check_fn_sig(genv, wfckresults, impl_item.owner_id, fn_sig)
+        }
+        fhir::ImplItemKind::Type(_) => Ok(()),
+    }
+}
+
+pub(crate) fn check_fn_sig<'genv>(
+    genv: GlobalEnv<'genv, '_>,
+    wfckresults: &mut WfckResults<'genv>,
     owner_id: OwnerId,
     fn_sig: &fhir::FnSig,
 ) -> Result<(), ErrorGuaranteed> {
-    if fn_sig.lifted {
+    if fn_sig.decl.lifted {
         return Ok(());
     }
-    let self_ty = lift::lift_self_ty(genv.tcx, genv.sess, owner_id)?;
-    let expected_fn_sig = &lift::lift_fn(genv.tcx, genv.sess, owner_id)?.1.fn_sig;
-    Zipper::new(genv, wfckresults, self_ty.as_ref()).zip_fn_sig(fn_sig, expected_fn_sig)
+    let self_ty = lift::lift_self_ty(genv, owner_id)?;
+    let expected_fn_decl = &lift::lift_fn_decl(genv, owner_id)?.0;
+    Zipper::new(genv, wfckresults, self_ty).zip_fn_decl(fn_sig.decl, expected_fn_decl)
 }
 
-pub fn check_alias(
-    genv: &GlobalEnv,
-    wfckresults: &mut WfckResults,
+pub(crate) fn check_ty_alias<'genv>(
+    genv: GlobalEnv<'genv, '_>,
+    wfckresults: &mut WfckResults<'genv>,
+    owner_id: OwnerId,
     ty_alias: &fhir::TyAlias,
 ) -> Result<(), ErrorGuaranteed> {
     if ty_alias.lifted {
         return Ok(());
     }
-    let (.., expected_ty_alias) = lift::lift_type_alias(genv.tcx, genv.sess, ty_alias.owner_id)?;
+    let expected_ty_alias = lift::lift_type_alias(genv, owner_id)?;
     Zipper::new(genv, wfckresults, None).zip_ty(&ty_alias.ty, &expected_ty_alias.ty)
 }
 
-pub fn check_struct_def(
-    genv: &GlobalEnv,
-    wfckresults: &mut WfckResults,
+pub(crate) fn check_struct_def<'genv>(
+    genv: GlobalEnv<'genv, '_>,
+    wfckresults: &mut WfckResults<'genv>,
+    owner_id: OwnerId,
     struct_def: &fhir::StructDef,
 ) -> Result<(), ErrorGuaranteed> {
     match &struct_def.kind {
         fhir::StructKind::Transparent { fields } => {
-            let mut liftcx = LiftCtxt::new(genv.tcx, genv.sess, struct_def.owner_id, None);
+            let local_id_gen = IndexGen::new();
+            let mut liftcx = LiftCtxt::new(genv, owner_id, &local_id_gen, None);
             fields.iter().try_for_each_exhaust(|field| {
                 if field.lifted {
                     return Ok(());
                 }
-                let self_ty = lift::lift_self_ty(genv.tcx, genv.sess, struct_def.owner_id)?;
-                Zipper::new(genv, wfckresults, self_ty.as_ref())
+                let self_ty = lift::lift_self_ty(genv, owner_id)?;
+                Zipper::new(genv, wfckresults, self_ty)
                     .zip_ty(&field.ty, &liftcx.lift_field_def_id(field.def_id)?.ty)
             })
         }
@@ -68,38 +130,38 @@ pub fn check_struct_def(
     }
 }
 
-pub fn check_enum_def(
-    genv: &GlobalEnv,
-    wfckresults: &mut WfckResults,
+pub(crate) fn check_enum_def<'genv>(
+    genv: GlobalEnv<'genv, '_>,
+    wfckresults: &mut WfckResults<'genv>,
+    owner_id: OwnerId,
     enum_def: &fhir::EnumDef,
 ) -> Result<(), ErrorGuaranteed> {
-    let tcx = genv.tcx;
-    let sess = genv.sess;
-    let mut liftcx = LiftCtxt::new(tcx, sess, enum_def.owner_id, None);
+    let local_id_gen = IndexGen::new();
+    let mut liftcx = LiftCtxt::new(genv, owner_id, &local_id_gen, None);
     enum_def.variants.iter().try_for_each_exhaust(|variant| {
         if variant.lifted {
             return Ok(());
         }
-        let self_ty = lift::lift_self_ty(genv.tcx, sess, enum_def.owner_id)?;
-        Zipper::new(genv, wfckresults, self_ty.as_ref())
+        let self_ty = lift::lift_self_ty(genv, owner_id)?;
+        Zipper::new(genv, wfckresults, self_ty)
             .zip_enum_variant(variant, &liftcx.lift_enum_variant_id(variant.def_id)?)
     })
 }
 
-struct Zipper<'zip, 'tcx> {
-    genv: &'zip GlobalEnv<'zip, 'tcx>,
-    wfckresults: &'zip mut WfckResults,
-    locs: LocsMap<'zip>,
-    self_ty: Option<&'zip fhir::Ty>,
+struct Zipper<'zip, 'genv, 'tcx> {
+    genv: GlobalEnv<'genv, 'tcx>,
+    wfckresults: &'zip mut WfckResults<'genv>,
+    locs: LocsMap<'genv>,
+    self_ty: Option<fhir::Ty<'genv>>,
 }
 
-type LocsMap<'a> = UnordMap<fhir::Name, &'a fhir::Ty>;
+type LocsMap<'genv> = UnordMap<fhir::ParamId, fhir::Ty<'genv>>;
 
-impl<'zip, 'tcx> Zipper<'zip, 'tcx> {
+impl<'zip, 'genv, 'tcx> Zipper<'zip, 'genv, 'tcx> {
     fn new(
-        genv: &'zip GlobalEnv<'zip, 'tcx>,
-        wfckresults: &'zip mut WfckResults,
-        self_ty: Option<&'zip fhir::Ty>,
+        genv: GlobalEnv<'genv, 'tcx>,
+        wfckresults: &'zip mut WfckResults<'genv>,
+        self_ty: Option<fhir::Ty<'genv>>,
     ) -> Self {
         Self { genv, wfckresults, locs: LocsMap::default(), self_ty }
     }
@@ -107,39 +169,43 @@ impl<'zip, 'tcx> Zipper<'zip, 'tcx> {
     fn zip_enum_variant(
         &mut self,
         variant: &fhir::VariantDef,
-        expected_variant: &'zip fhir::VariantDef,
+        expected_variant: &fhir::VariantDef<'genv>,
     ) -> Result<(), ErrorGuaranteed> {
         if variant.fields.len() != expected_variant.fields.len() {
             return Err(
                 self.emit_err(errors::FieldCountMismatch::from_variants(variant, expected_variant))
             );
         }
-        iter::zip(&variant.fields, &expected_variant.fields).try_for_each_exhaust(
+        iter::zip(variant.fields, expected_variant.fields).try_for_each_exhaust(
             |(field, expected_field)| self.zip_ty(&field.ty, &expected_field.ty),
         )?;
 
         self.zip_bty(&variant.ret.bty, &expected_variant.ret.bty)
     }
 
-    fn zip_fn_sig(
+    fn zip_fn_decl(
         &mut self,
-        fn_sig: &fhir::FnSig,
-        expected_fn_sig: &'zip fhir::FnSig,
+        fn_decl: &fhir::FnDecl,
+        expected_fn_sig: &fhir::FnDecl<'genv>,
     ) -> Result<(), ErrorGuaranteed> {
-        if fn_sig.args.len() != expected_fn_sig.args.len() {
-            return Err(self.emit_err(errors::FunArgCountMismatch::new(fn_sig, expected_fn_sig)));
+        if fn_decl.args.len() != expected_fn_sig.args.len() {
+            return Err(self.emit_err(errors::FunArgCountMismatch::new(fn_decl, expected_fn_sig)));
         }
-        self.zip_tys(&fn_sig.args, &expected_fn_sig.args)?;
-        self.zip_constraints(&fn_sig.requires)?;
+        self.zip_tys(fn_decl.args, expected_fn_sig.args)?;
+        self.zip_constraints(fn_decl.requires)?;
 
-        self.zip_ty(&fn_sig.output.ret, &expected_fn_sig.output.ret)?;
-        self.zip_constraints(&fn_sig.output.ensures)
+        self.zip_ty(&fn_decl.output.ret, &expected_fn_sig.output.ret)?;
+        self.zip_constraints(fn_decl.output.ensures)
     }
 
     fn zip_constraints(&mut self, constrs: &[fhir::Constraint]) -> Result<(), ErrorGuaranteed> {
         constrs.iter().try_for_each_exhaust(|constr| {
-            if let fhir::Constraint::Type(loc, ty, _) = constr {
-                self.zip_ty(ty, self.locs[&loc.name])
+            if let fhir::Constraint::Type(loc, ty) = constr {
+                let ExprRes::Param(_, id) = loc.res else {
+                    span_bug!(loc.span, "unexpected path in loc position")
+                };
+                let expected_ty = self.locs[&id];
+                self.zip_ty(ty, &expected_ty)
             } else {
                 Ok(())
             }
@@ -149,7 +215,7 @@ impl<'zip, 'tcx> Zipper<'zip, 'tcx> {
     fn zip_tys(
         &mut self,
         tys: &[fhir::Ty],
-        expected_tys: &'zip [fhir::Ty],
+        expected_tys: &[fhir::Ty<'genv>],
     ) -> Result<(), ErrorGuaranteed> {
         iter::zip(tys, expected_tys)
             .try_for_each_exhaust(|(ty, expected)| self.zip_ty(ty, expected))
@@ -158,20 +224,23 @@ impl<'zip, 'tcx> Zipper<'zip, 'tcx> {
     fn zip_ty(
         &mut self,
         ty: &fhir::Ty,
-        expected_ty: &'zip fhir::Ty,
+        expected_ty: &fhir::Ty<'genv>,
     ) -> Result<(), ErrorGuaranteed> {
-        match (&ty.kind, &expected_ty.kind) {
+        match (ty.kind, expected_ty.kind) {
             (fhir::TyKind::Constr(_, ty) | fhir::TyKind::Exists(.., ty), _) => {
                 self.zip_ty(ty, expected_ty)
             }
             (
                 fhir::TyKind::BaseTy(bty) | fhir::TyKind::Indexed(bty, _),
                 fhir::TyKind::BaseTy(expected_bty),
-            ) => self.zip_bty(bty, expected_bty),
+            ) => self.zip_bty(&bty, &expected_bty),
             (fhir::TyKind::Ptr(lft, loc), fhir::TyKind::Ref(expected_lft, expected_mut_ty)) => {
                 if expected_mut_ty.mutbl.is_mut() {
-                    self.zip_lifetime(*lft, *expected_lft);
-                    self.locs.insert(loc.name, &expected_mut_ty.ty);
+                    let ExprRes::Param(_, id) = loc.res else {
+                        span_bug!(loc.span, "unexpected path in loc position")
+                    };
+                    self.zip_lifetime(lft, expected_lft);
+                    self.locs.insert(id, *expected_mut_ty.ty);
                     Ok(())
                 } else {
                     Err(self.emit_err(
@@ -188,8 +257,8 @@ impl<'zip, 'tcx> Zipper<'zip, 'tcx> {
                             .with_note("types differ in mutability"),
                     ));
                 }
-                self.zip_lifetime(*lft, *expected_lft);
-                self.zip_ty(&mut_ty.ty, &expected_mut_ty.ty)
+                self.zip_lifetime(lft, expected_lft);
+                self.zip_ty(mut_ty.ty, expected_mut_ty.ty)
             }
             (fhir::TyKind::Tuple(tys), fhir::TyKind::Tuple(expected_tys)) => {
                 if tys.len() != expected_tys.len() {
@@ -202,7 +271,7 @@ impl<'zip, 'tcx> Zipper<'zip, 'tcx> {
             }
             (fhir::TyKind::Array(ty, len), fhir::TyKind::Array(expected_ty, expected_len)) => {
                 if len.val != expected_len.val {
-                    return Err(self.emit_err(errors::ArrayLenMismatch::new(len, expected_len)));
+                    return Err(self.emit_err(errors::ArrayLenMismatch::new(&len, &expected_len)));
                 }
                 self.zip_ty(ty, expected_ty)
             }
@@ -222,7 +291,7 @@ impl<'zip, 'tcx> Zipper<'zip, 'tcx> {
             (fhir::TyKind::Hole(fhir_id), _) => {
                 self.wfckresults
                     .type_holes_mut()
-                    .insert(*fhir_id, expected_ty.clone());
+                    .insert(fhir_id, *expected_ty);
                 Ok(())
             }
             (
@@ -254,7 +323,7 @@ impl<'zip, 'tcx> Zipper<'zip, 'tcx> {
     fn zip_generic_arg(
         &mut self,
         arg1: &fhir::GenericArg,
-        arg2: &'zip fhir::GenericArg,
+        arg2: &fhir::GenericArg<'genv>,
     ) -> Result<(), ErrorGuaranteed> {
         match (arg1, arg2) {
             (fhir::GenericArg::Type(ty1), fhir::GenericArg::Type(ty2)) => self.zip_ty(ty1, ty2),
@@ -284,11 +353,11 @@ impl<'zip, 'tcx> Zipper<'zip, 'tcx> {
     fn zip_bty(
         &mut self,
         bty: &fhir::BaseTy,
-        expected_bty: &'zip fhir::BaseTy,
+        expected_bty: &fhir::BaseTy<'genv>,
     ) -> Result<(), ErrorGuaranteed> {
-        match (&bty.kind, &expected_bty.kind) {
+        match (bty.kind, expected_bty.kind) {
             (fhir::BaseTyKind::Path(qpath), fhir::BaseTyKind::Path(expected_qpath)) => {
-                self.zip_qpath(qpath, expected_qpath)
+                self.zip_qpath(&qpath, &expected_qpath)
             }
             (fhir::BaseTyKind::Slice(ty), fhir::BaseTyKind::Slice(expected_ty)) => {
                 self.zip_ty(ty, expected_ty)
@@ -300,7 +369,7 @@ impl<'zip, 'tcx> Zipper<'zip, 'tcx> {
     fn zip_qpath(
         &mut self,
         qpath: &fhir::QPath,
-        expected_qpath: &'zip fhir::QPath,
+        expected_qpath: &fhir::QPath<'genv>,
     ) -> Result<(), ErrorGuaranteed> {
         match (qpath, expected_qpath) {
             (fhir::QPath::Resolved(None, path), fhir::QPath::Resolved(None, expected_path)) => {
@@ -323,7 +392,7 @@ impl<'zip, 'tcx> Zipper<'zip, 'tcx> {
         };
         if let Res::Def(res_kind, res_did) = res
             && let Res::Def(expected_kind, expected_did) = expected
-            && let Some(extern_id) = self.genv.map().get_extern(res_did)
+            && let Some(extern_id) = self.genv.get_local_id_for_extern(res_did)
             && res_kind == expected_kind
             && extern_id.to_def_id() == expected_did
         {
@@ -335,38 +404,40 @@ impl<'zip, 'tcx> Zipper<'zip, 'tcx> {
     fn zip_path(
         &mut self,
         path: &fhir::Path,
-        expected_path: &'zip fhir::Path,
+        expected_path: &fhir::Path<'genv>,
     ) -> Result<(), ErrorGuaranteed> {
         if !self.is_same_res(path.res, expected_path.res) {
             if let fhir::Res::SelfTyAlias { .. } = expected_path.res
                 && let Some(self_ty) = self.self_ty
                 && let Some(expected_path) = self_ty.as_path()
             {
-                return self.zip_path(path, expected_path);
+                return self.zip_path(path, &expected_path);
             }
             return Err(self.emit_err(errors::InvalidRefinement::from_paths(path, expected_path)));
         }
-        if path.args.len() != expected_path.args.len() {
+        // TODO(nilehmann) we should check all segments here
+        if path.last_segment().args.len() != expected_path.last_segment().args.len() {
             return Err(self.emit_err(errors::GenericArgCountMismatch::new(path, expected_path)));
         }
 
-        iter::zip(&path.args, &expected_path.args)
+        iter::zip(path.last_segment().args, expected_path.last_segment().args)
             .try_for_each_exhaust(|(arg, expected)| self.zip_generic_arg(arg, expected))
     }
 
     #[track_caller]
-    fn emit_err<'a>(&'a self, err: impl IntoDiagnostic<'a>) -> ErrorGuaranteed {
-        self.genv.sess.emit_err(err)
+    fn emit_err<'a>(&'a self, err: impl Diagnostic<'a>) -> ErrorGuaranteed {
+        self.genv.sess().emit_err(err)
     }
 }
 
 mod errors {
+    use flux_errors::E0999;
     use flux_macros::Diagnostic;
     use flux_middle::fhir;
     use rustc_span::Span;
 
     #[derive(Diagnostic)]
-    #[diag(fhir_analysis_invalid_refinement, code = "FLUX")]
+    #[diag(fhir_analysis_invalid_refinement, code = E0999)]
     pub(super) struct InvalidRefinement {
         #[primary_span]
         #[label]
@@ -426,7 +497,7 @@ mod errors {
     }
 
     #[derive(Diagnostic)]
-    #[diag(fhir_analysis_fun_arg_count_mismatch, code = "FLUX")]
+    #[diag(fhir_analysis_fun_arg_count_mismatch, code = E0999)]
     pub(super) struct FunArgCountMismatch {
         #[primary_span]
         #[label]
@@ -438,18 +509,18 @@ mod errors {
     }
 
     impl FunArgCountMismatch {
-        pub(super) fn new(fn_sig: &fhir::FnSig, expected_fn_sig: &fhir::FnSig) -> Self {
+        pub(super) fn new(decl: &fhir::FnDecl, expected_decl: &fhir::FnDecl) -> Self {
             Self {
-                span: fn_sig.span,
-                args: fn_sig.args.len(),
-                expected_span: expected_fn_sig.span,
-                expected_args: expected_fn_sig.args.len(),
+                span: decl.span,
+                args: decl.args.len(),
+                expected_span: expected_decl.span,
+                expected_args: expected_decl.args.len(),
             }
         }
     }
 
     #[derive(Diagnostic)]
-    #[diag(fhir_analysis_generic_argument_count_mismatch, code = "FLUX")]
+    #[diag(fhir_analysis_generic_argument_count_mismatch, code = E0999)]
     pub(super) struct GenericArgCountMismatch {
         #[primary_span]
         #[label]
@@ -465,8 +536,8 @@ mod errors {
         pub(super) fn new(path: &fhir::Path, expected_path: &fhir::Path) -> Self {
             GenericArgCountMismatch {
                 span: path.span,
-                found: path.args.len(),
-                expected: expected_path.args.len(),
+                found: path.last_segment().args.len(),
+                expected: expected_path.last_segment().args.len(),
                 def_descr: path.res.descr(),
                 expected_span: expected_path.span,
             }
@@ -474,7 +545,7 @@ mod errors {
     }
 
     #[derive(Diagnostic)]
-    #[diag(fhir_analysis_array_len_mismatch, code = "FLUX")]
+    #[diag(fhir_analysis_array_len_mismatch, code = E0999)]
     pub(super) struct ArrayLenMismatch {
         #[primary_span]
         #[label]
@@ -497,7 +568,7 @@ mod errors {
     }
 
     #[derive(Diagnostic)]
-    #[diag(fhir_analysis_field_count_mismatch, code = "FLUX")]
+    #[diag(fhir_analysis_field_count_mismatch, code = E0999)]
     pub(super) struct FieldCountMismatch {
         #[primary_span]
         #[label]

@@ -1,147 +1,297 @@
-use std::{borrow::Borrow, rc::Rc};
+use std::{alloc, ptr, rc::Rc, slice};
 
-use flux_common::bug;
+use flux_common::{bug, result::ErrorEmitter};
+use flux_config::CrateConfig;
 use flux_errors::FluxSession;
+use rustc_data_structures::unord::UnordMap;
 use rustc_hash::FxHashSet;
 use rustc_hir::{
     def::DefKind,
     def_id::{DefId, LocalDefId},
-    LangItem, PrimTy,
+    LangItem,
 };
 use rustc_middle::ty::{TyCtxt, Variance};
 pub use rustc_span::{symbol::Ident, Symbol};
 
 use crate::{
     cstore::CrateStoreDyn,
-    fhir::{self, FluxLocalDefId, VariantIdx},
+    fhir::{self, FluxLocalDefId, Ignored, VariantIdx},
     intern::List,
-    queries::{Providers, Queries, QueryResult},
-    rty::{self, fold::TypeFoldable, normalize::Defns, refining::Refiner, GenericParamDefKind},
-    rustc::{self, ty},
+    queries::{Providers, Queries, QueryErr, QueryResult},
+    rty::{self, normalize::SpecFuncDefns, refining::Refiner},
+    rustc::{self, lowering, ty},
 };
 
-pub struct GlobalEnv<'sess, 'tcx> {
-    pub tcx: TyCtxt<'tcx>,
-    pub sess: &'sess FluxSession,
-    cstore: Box<CrateStoreDyn>,
-    map: fhir::Map,
-    queries: Queries<'tcx>,
+#[derive(Clone, Copy)]
+pub struct GlobalEnv<'genv, 'tcx> {
+    inner: &'genv GlobalEnvInner<'genv, 'tcx>,
 }
 
-impl<'sess, 'tcx> GlobalEnv<'sess, 'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, sess: &'sess FluxSession, cstore: Box<CrateStoreDyn>) -> Self {
-        GlobalEnv { tcx, sess, cstore, map: fhir::Map::new(), queries: Queries::default() }
+struct GlobalEnvInner<'genv, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    sess: &'genv FluxSession,
+    arena: &'genv fhir::Arena,
+    cstore: Box<CrateStoreDyn>,
+    queries: Queries<'genv, 'tcx>,
+}
+
+impl<'tcx> GlobalEnv<'_, 'tcx> {
+    pub fn enter<'a, R>(
+        tcx: TyCtxt<'tcx>,
+        sess: &'a FluxSession,
+        cstore: Box<CrateStoreDyn>,
+        arena: &'a fhir::Arena,
+        providers: Providers,
+        f: impl for<'genv> FnOnce(GlobalEnv<'genv, 'tcx>) -> R,
+    ) -> R {
+        let inner = GlobalEnvInner { tcx, sess, cstore, arena, queries: Queries::new(providers) };
+        f(GlobalEnv { inner: &inner })
+    }
+}
+
+impl<'genv, 'tcx> GlobalEnv<'genv, 'tcx> {
+    pub fn tcx(self) -> TyCtxt<'tcx> {
+        self.inner.tcx
     }
 
-    pub fn providers(&mut self) -> &mut Providers {
-        &mut self.queries.providers
+    pub fn hir(&self) -> rustc_middle::hir::map::Map<'tcx> {
+        self.tcx().hir()
     }
 
-    pub fn map(&self) -> &fhir::Map {
-        &self.map
+    pub fn sess(self) -> &'genv FluxSession {
+        self.inner.sess
     }
 
-    pub fn map_mut(&mut self) -> &mut fhir::Map {
-        &mut self.map
+    pub fn collect_specs(self) -> &'genv crate::Specs {
+        self.inner.queries.collect_specs(self)
     }
 
-    pub fn defns(&self) -> QueryResult<&Defns> {
-        self.queries.defns(self)
+    pub fn resolve_crate(self) -> &'genv crate::ResolverOutput {
+        self.inner.queries.resolve_crate(self)
     }
 
-    pub fn qualifiers(
-        &self,
+    pub fn desugar(self, def_id: LocalDefId) -> QueryResult<fhir::Node<'genv>> {
+        self.inner.queries.desugar(self, def_id)
+    }
+
+    pub fn fhir_crate(self) -> &'genv fhir::Crate<'genv> {
+        self.inner.queries.fhir_crate(self)
+    }
+
+    pub fn map(self) -> Map<'genv, 'tcx> {
+        Map::new(self, self.fhir_crate())
+    }
+
+    pub fn alloc<T>(&self, val: T) -> &'genv T {
+        self.inner.arena.alloc(val)
+    }
+
+    pub fn alloc_slice<T: Copy>(self, slice: &[T]) -> &'genv [T] {
+        self.inner.arena.alloc_slice_copy(slice)
+    }
+
+    pub fn alloc_slice_fill_iter<T, I>(self, it: I) -> &'genv [T]
+    where
+        I: IntoIterator<Item = T>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        self.inner.arena.alloc_slice_fill_iter(it)
+    }
+
+    pub fn def_kind(&self, def_id: impl Into<DefId>) -> DefKind {
+        self.tcx().def_kind(def_id.into())
+    }
+
+    /// Allocates space to store `cap` elements of type `T`.
+    ///
+    /// The elements are initialized using the supplied iterator. At most `cap` elements will be
+    /// retrived from the iterator. If the iterator yields fewer than `cap` elements, the returned
+    /// slice will be of length less than the allocated capacity.
+    ///
+    /// ## Panics
+    ///
+    /// Panics if reserving space for the slice fails.
+    pub fn alloc_slice_with_capacity<T, I>(self, cap: usize, it: I) -> &'genv [T]
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let layout = alloc::Layout::array::<T>(cap).unwrap_or_else(|_| panic!("out of memory"));
+        let dst = self.inner.arena.alloc_layout(layout).cast::<T>();
+        unsafe {
+            let mut len = 0;
+            for (i, v) in it.into_iter().take(cap).enumerate() {
+                len += 1;
+                ptr::write(dst.as_ptr().add(i), v);
+            }
+
+            slice::from_raw_parts(dst.as_ptr(), len)
+        }
+    }
+
+    pub fn spec_func_defns(&self) -> QueryResult<&SpecFuncDefns> {
+        self.inner.queries.spec_func_defns(*self)
+    }
+
+    /// Return all the qualifiers that apply to an item, including both global and local qualifiers.
+    pub fn qualifiers_for(
+        self,
         did: LocalDefId,
-    ) -> QueryResult<impl Iterator<Item = &rty::Qualifier>> {
-        let names: FxHashSet<Symbol> = self.map().get_fn_quals(did).map(|qual| qual.name).collect();
+    ) -> QueryResult<impl Iterator<Item = &'genv rty::Qualifier>> {
+        let names: FxHashSet<Symbol> = self
+            .map()
+            .fn_quals_for(did)?
+            .iter()
+            .map(|qual| qual.name)
+            .collect();
         Ok(self
+            .inner
             .queries
             .qualifiers(self)?
             .iter()
             .filter(move |qualifier| qualifier.global || names.contains(&qualifier.name)))
     }
 
-    pub fn func_decls(&self) -> impl Iterator<Item = &rty::FuncDecl> {
-        self.queries.func_decls(self).values()
+    pub fn func_decls(self) -> QueryResult<impl Iterator<Item = &'genv rty::SpecFuncDecl>> {
+        Ok(self.inner.queries.func_decls(self)?.values())
     }
 
-    pub fn variances_of(&self, did: DefId) -> &[Variance] {
-        self.tcx.variances_of(did)
+    pub fn func_decl(self, name: Symbol) -> QueryResult<rty::SpecFuncDecl> {
+        Ok(self.inner.queries.func_decls(self)?[&name].clone())
+    }
+
+    pub fn variances_of(self, did: DefId) -> &'tcx [Variance] {
+        self.tcx().variances_of(did)
     }
 
     pub fn mk_box(&self, ty: rty::Ty, alloc: rty::Ty) -> rty::Ty {
-        let def_id = self.tcx.require_lang_item(LangItem::OwnedBox, None);
+        let def_id = self.tcx().require_lang_item(LangItem::OwnedBox, None);
         let adt_def = self.adt_def(def_id).unwrap();
 
-        // this is harcoding that `Box` has two type parameters and
-        // it is indexed by unit. We leave this as a reminder in case
-        // that ever changes.
-        debug_assert_eq!(self.generics_of(def_id).unwrap().params.len(), 2);
-        debug_assert!(adt_def.sort().is_unit());
+        let args = vec![rty::GenericArg::Ty(ty), rty::GenericArg::Ty(alloc)];
 
-        let bty =
-            rty::BaseTy::adt(adt_def, vec![rty::GenericArg::Ty(ty), rty::GenericArg::Ty(alloc)]);
-        rty::Ty::indexed(bty, rty::Index::unit())
+        let bty = rty::BaseTy::adt(adt_def, args);
+        rty::Ty::indexed(bty, rty::Expr::unit_adt(def_id))
     }
 
-    pub fn mir(&self, def_id: LocalDefId) -> QueryResult<Rc<rustc::mir::Body<'tcx>>> {
-        self.queries.mir(self, def_id)
+    pub fn mir(self, def_id: LocalDefId) -> QueryResult<Rc<rustc::mir::Body<'tcx>>> {
+        self.inner.queries.mir(self, def_id)
     }
 
-    pub fn lower_type_of(&self, def_id: impl Into<DefId>) -> QueryResult<ty::EarlyBinder<ty::Ty>> {
-        self.queries.lower_type_of(self, def_id.into())
+    pub fn lower_generics_of(self, def_id: impl Into<DefId>) -> QueryResult<ty::Generics<'tcx>> {
+        self.inner.queries.lower_generics_of(self, def_id.into())
     }
 
-    pub fn lower_fn_sig(&self, def_id: DefId) -> QueryResult<ty::EarlyBinder<ty::PolyFnSig>> {
-        self.queries.lower_fn_sig(self, def_id)
+    pub fn lower_predicates_of(
+        self,
+        def_id: impl Into<DefId>,
+    ) -> QueryResult<ty::GenericPredicates> {
+        self.inner.queries.lower_predicates_of(self, def_id.into())
     }
 
-    pub fn adt_def(&self, def_id: impl Into<DefId>) -> QueryResult<rty::AdtDef> {
-        self.queries.adt_def(self, def_id.into())
+    pub fn lower_type_of(self, def_id: impl Into<DefId>) -> QueryResult<ty::EarlyBinder<ty::Ty>> {
+        self.inner.queries.lower_type_of(self, def_id.into())
+    }
+
+    pub fn lower_fn_sig(self, def_id: DefId) -> QueryResult<ty::EarlyBinder<ty::PolyFnSig>> {
+        self.inner.queries.lower_fn_sig(self, def_id)
+    }
+
+    pub fn adt_def(self, def_id: impl Into<DefId>) -> QueryResult<rty::AdtDef> {
+        self.inner.queries.adt_def(self, def_id.into())
+    }
+
+    pub fn adt_sort_def_of(self, def_id: impl Into<DefId>) -> QueryResult<rty::AdtSortDef> {
+        self.inner.queries.adt_sort_def_of(self, def_id.into())
     }
 
     pub fn check_wf(
-        &self,
+        self,
         flux_id: impl Into<FluxLocalDefId>,
-    ) -> QueryResult<Rc<fhir::WfckResults>> {
-        self.queries.check_wf(self, flux_id.into())
+    ) -> QueryResult<Rc<rty::WfckResults<'genv>>> {
+        self.inner.queries.check_wf(self, flux_id.into())
     }
 
-    pub fn generics_of(&self, def_id: impl Into<DefId>) -> QueryResult<rty::Generics> {
-        self.queries.generics_of(self, def_id.into())
+    pub fn impl_trait_ref(
+        self,
+        impl_id: DefId,
+    ) -> QueryResult<Option<rty::EarlyBinder<rty::TraitRef>>> {
+        let impl_id = self.extern_id_of(impl_id)?.unwrap_or(impl_id);
+
+        let Some(poly_trait_ref) = self.tcx().impl_trait_ref(impl_id) else { return Ok(None) };
+
+        let trait_ref = lowering::lower_trait_ref(self.tcx(), poly_trait_ref.skip_binder())
+            .map_err(|err| QueryErr::unsupported(impl_id, err.into_err()))?;
+        let impl_generics = self.generics_of(impl_id)?;
+        let trait_ref = Refiner::default(self, &impl_generics).refine_trait_ref(&trait_ref)?;
+        Ok(Some(rty::EarlyBinder(trait_ref)))
+    }
+
+    pub fn generics_of(self, def_id: impl Into<DefId>) -> QueryResult<rty::Generics> {
+        self.inner.queries.generics_of(self, def_id.into())
+    }
+
+    pub fn refinement_generics_of(
+        self,
+        def_id: impl Into<DefId>,
+    ) -> QueryResult<rty::RefinementGenerics> {
+        self.inner
+            .queries
+            .refinement_generics_of(self, def_id.into())
     }
 
     pub fn predicates_of(
-        &self,
+        self,
         def_id: impl Into<DefId>,
     ) -> QueryResult<rty::EarlyBinder<rty::GenericPredicates>> {
-        self.queries.predicates_of(self, def_id.into())
+        self.inner.queries.predicates_of(self, def_id.into())
     }
 
-    pub fn item_bounds(&self, def_id: DefId) -> QueryResult<rty::EarlyBinder<List<rty::Clause>>> {
-        self.queries.item_bounds(self, def_id)
-    }
-
-    pub fn type_of(&self, def_id: DefId) -> QueryResult<rty::EarlyBinder<rty::PolyTy>> {
-        self.queries.type_of(self, def_id)
-    }
-
-    pub fn fn_sig(
-        &self,
+    pub fn assoc_refinements_of(
+        self,
         def_id: impl Into<DefId>,
-    ) -> QueryResult<rty::EarlyBinder<rty::PolyFnSig>> {
-        self.queries.fn_sig(self, def_id.into())
+    ) -> QueryResult<rty::AssocRefinements> {
+        self.inner.queries.assoc_refinements_of(self, def_id.into())
+    }
+
+    pub fn assoc_refinement_def(
+        self,
+        impl_id: DefId,
+        name: Symbol,
+    ) -> QueryResult<rty::EarlyBinder<rty::Lambda>> {
+        self.inner.queries.assoc_refinement_def(self, impl_id, name)
+    }
+
+    pub fn sort_of_assoc_reft(
+        self,
+        def_id: impl Into<DefId>,
+        name: Symbol,
+    ) -> QueryResult<Option<rty::EarlyBinder<rty::FuncSort>>> {
+        self.inner
+            .queries
+            .sort_of_assoc_reft(self, def_id.into(), name)
+    }
+
+    pub fn item_bounds(self, def_id: DefId) -> QueryResult<rty::EarlyBinder<List<rty::Clause>>> {
+        self.inner.queries.item_bounds(self, def_id)
+    }
+
+    pub fn type_of(self, def_id: DefId) -> QueryResult<rty::EarlyBinder<rty::TyCtor>> {
+        self.inner.queries.type_of(self, def_id)
+    }
+
+    pub fn fn_sig(self, def_id: impl Into<DefId>) -> QueryResult<rty::EarlyBinder<rty::PolyFnSig>> {
+        self.inner.queries.fn_sig(self, def_id.into())
     }
 
     pub fn variants_of(
-        &self,
+        self,
         def_id: DefId,
     ) -> QueryResult<rty::Opaqueness<rty::EarlyBinder<rty::PolyVariants>>> {
-        self.queries.variants_of(self, def_id)
+        self.inner.queries.variants_of(self, def_id)
     }
 
     pub fn variant_sig(
-        &self,
+        self,
         def_id: DefId,
         variant_idx: VariantIdx,
     ) -> QueryResult<rty::Opaqueness<rty::EarlyBinder<rty::PolyVariant>>> {
@@ -151,239 +301,36 @@ impl<'sess, 'tcx> GlobalEnv<'sess, 'tcx> {
     }
 
     pub fn lower_late_bound_vars(
-        &self,
+        self,
         def_id: LocalDefId,
     ) -> QueryResult<List<rustc::ty::BoundVariableKind>> {
-        self.queries.lower_late_bound_vars(self, def_id)
+        self.inner.queries.lower_late_bound_vars(self, def_id)
     }
 
-    pub fn get_generic_param(&self, def_id: LocalDefId) -> &fhir::GenericParam {
+    pub fn get_generic_param(&self, def_id: LocalDefId) -> QueryResult<&fhir::GenericParam> {
         let owner = self.hir().ty_param_owner(def_id);
-        self.map().get_generics(owner).unwrap().get_param(def_id)
+        Ok(self.map().get_generics(owner)?.unwrap().get_param(def_id))
     }
 
     pub fn is_box(&self, res: fhir::Res) -> bool {
-        if let fhir::Res::Def(DefKind::Struct, def_id) = res {
-            self.tcx.adt_def(def_id).is_box()
-        } else {
-            false
+        res.is_box(self.tcx())
+    }
+
+    pub fn def_id_to_param_ty(&self, def_id: LocalDefId) -> rty::ParamTy {
+        rty::ParamTy {
+            index: self.def_id_to_param_index(def_id),
+            name: self.tcx().hir().ty_param_name(def_id),
         }
     }
 
-    pub fn func_decl(&self, name: impl Borrow<Symbol>) -> Option<&fhir::FuncDecl> {
-        self.map().func_decl(name)
-    }
-
-    pub fn const_by_name(&self, name: impl Borrow<Symbol>) -> Option<&fhir::ConstInfo> {
-        self.map().const_by_name(name)
-    }
-
-    pub fn sort_of_bty(&self, bty: &fhir::BaseTy) -> Option<fhir::Sort> {
-        match &bty.kind {
-            fhir::BaseTyKind::Path(fhir::QPath::Resolved(_, path)) => self.sort_of_path(path),
-            fhir::BaseTyKind::Slice(_) => Some(fhir::Sort::Int),
-        }
-    }
-
-    pub fn index_sorts_of(
-        &self,
-        def_id: impl Into<DefId>,
-        sort_args: &[fhir::Sort],
-    ) -> Vec<fhir::Sort> {
-        let def_id = def_id.into();
-        if let Some(local_id) = def_id.as_local().or_else(|| self.map().get_extern(def_id)) {
-            self.map().refined_by(local_id).index_sorts(sort_args)
-        } else {
-            self.cstore()
-                .refined_by(def_id)
-                .map(|rby| rby.index_sorts(sort_args))
-                .unwrap_or_default()
-        }
-    }
-
-    pub fn sort_of_path(&self, path: &fhir::Path) -> Option<fhir::Sort> {
-        // CODESYNC(sort-of, 3) sorts should be given consistently
-        match path.res {
-            fhir::Res::PrimTy(PrimTy::Int(_) | PrimTy::Uint(_)) => Some(fhir::Sort::Int),
-            fhir::Res::PrimTy(PrimTy::Bool) => Some(fhir::Sort::Bool),
-            fhir::Res::PrimTy(PrimTy::Float(..) | PrimTy::Str | PrimTy::Char) => {
-                Some(fhir::Sort::Unit)
-            }
-            fhir::Res::Def(DefKind::TyAlias { .. } | DefKind::Enum | DefKind::Struct, def_id) => {
-                let mut sort_args = vec![];
-                if let Ok(generics) = self.generics_of(def_id) {
-                    for (param, arg) in generics.params.iter().zip(&path.args) {
-                        if let GenericParamDefKind::SplTy = param.kind {
-                            let fhir::GenericArg::Type(ty) = arg else { return None };
-                            let sort = self.sort_of_ty(ty)?;
-                            sort_args.push(sort);
-                        }
-                    }
-                };
-                Some(fhir::Sort::Record(def_id, List::from_vec(sort_args)))
-            }
-            fhir::Res::SelfTyAlias { alias_to, .. } => self.sort_of_self_ty_alias(alias_to),
-            fhir::Res::Def(DefKind::TyParam, def_id) => self.sort_of_generic_param(def_id),
-            fhir::Res::Def(DefKind::AssocTy | DefKind::OpaqueTy, _)
-            | fhir::Res::SelfTyParam { .. } => None,
-            fhir::Res::Def(..) => bug!("unexpected res `{:?}`", path.res),
-        }
-    }
-
-    pub fn sort_of_self_ty_alias(&self, alias_to: DefId) -> Option<fhir::Sort> {
-        let self_ty = self.tcx.type_of(alias_to).instantiate_identity();
-        self.sort_of_self_ty(alias_to, self_ty)
-    }
-
-    pub fn sort_of_generic_param(&self, def_id: DefId) -> Option<fhir::Sort> {
-        let param = self.get_generic_param(def_id.expect_local());
-        match &param.kind {
-            fhir::GenericParamKind::BaseTy | fhir::GenericParamKind::SplTy => {
-                Some(fhir::Sort::Param(def_id))
-            }
-            fhir::GenericParamKind::Type { .. } | fhir::GenericParamKind::Lifetime => None,
-        }
-    }
-
-    fn sort_of_ty(&self, ty: &fhir::Ty) -> Option<fhir::Sort> {
-        match &ty.kind {
-            fhir::TyKind::BaseTy(bty) | fhir::TyKind::Indexed(bty, _) => {
-                self.sort_of_path(bty.as_path()?)
-            }
-            fhir::TyKind::Exists(_, ty) | fhir::TyKind::Constr(_, ty) => self.sort_of_ty(ty),
-            fhir::TyKind::RawPtr(_, _)
-            | fhir::TyKind::Ref(_, _)
-            | fhir::TyKind::Tuple(_)
-            | fhir::TyKind::Array(_, _)
-            | fhir::TyKind::Never => Some(fhir::Sort::Unit),
-            fhir::TyKind::Hole(_) => Some(fhir::Sort::Wildcard),
-            fhir::TyKind::Ptr(_, _) => None,
-            fhir::TyKind::OpaqueDef(_, _, _, _) => None,
-        }
-    }
-
-    fn sort_of_self_ty(&self, def_id: DefId, ty: rustc_middle::ty::Ty) -> Option<fhir::Sort> {
-        use rustc_middle::ty;
-        // CODESYNC(sort-of, 3) sorts should be given consistently
-        match ty.kind() {
-            ty::TyKind::Bool => Some(fhir::Sort::Bool),
-            ty::TyKind::Slice(_) | ty::TyKind::Int(_) | ty::TyKind::Uint(_) => {
-                Some(fhir::Sort::Int)
-            }
-            ty::TyKind::Adt(adt_def, args) => {
-                let mut sort_args = vec![];
-                for arg in *args {
-                    if let Some(ty) = arg.as_type()
-                        && let Some(sort) = self.sort_of_self_ty(def_id, ty)
-                    {
-                        sort_args.push(sort);
-                    }
-                }
-                Some(fhir::Sort::Record(adt_def.did(), List::from_vec(sort_args)))
-            }
-            ty::TyKind::Param(p) => {
-                let generic_param_def = self
-                    .tcx
-                    .generics_of(def_id)
-                    .param_at(p.index as usize, self.tcx);
-                self.sort_of_generic_param(generic_param_def.def_id)
-            }
-            ty::TyKind::Float(_)
-            | ty::TyKind::Str
-            | ty::TyKind::Char
-            | ty::TyKind::RawPtr(_)
-            | ty::TyKind::Ref(..)
-            | ty::TyKind::Tuple(_)
-            | ty::TyKind::Array(..)
-            | ty::TyKind::Never => Some(fhir::Sort::Unit),
-            _ => bug!("unexpected self ty {ty:?}"),
-        }
-    }
-
-    pub fn early_bound_sorts_of(&self, def_id: DefId, sort_args: &[fhir::Sort]) -> Vec<fhir::Sort> {
-        if let Some(local_id) = def_id.as_local() {
-            self.map().refined_by(local_id).early_bound_sorts(sort_args)
-        } else {
-            self.cstore()
-                .refined_by(def_id)
-                .map(|refined_by| refined_by.early_bound_sorts(sort_args))
-                .unwrap_or_default()
-        }
-    }
-
-    /// Whether values of this sort can be compared for equality.
-    pub fn has_equality(&self, sort: &fhir::Sort) -> bool {
-        match sort {
-            fhir::Sort::Int
-            | fhir::Sort::Bool
-            | fhir::Sort::Real
-            | fhir::Sort::Unit
-            | fhir::Sort::BitVec(_)
-            | fhir::Sort::Param(_)
-            | fhir::Sort::Var(_) => true,
-            fhir::Sort::Record(def_id, sort_args) => {
-                self.index_sorts_of(*def_id, sort_args)
-                    .iter()
-                    .all(|sort| self.has_equality(sort))
-            }
-            fhir::Sort::App(ctor, sorts) => self.ctor_has_equality(ctor, sorts),
-            fhir::Sort::Loc
-            | fhir::Sort::Func(_)
-            | fhir::Sort::Wildcard
-            | fhir::Sort::Infer(_)
-            | fhir::Sort::Error => false,
-        }
-    }
-
-    /// For now all sort constructors have equality if all the generic arguments do. In the
-    /// future we may have a more fine-grained notion of equality for sort constructors.
-    fn ctor_has_equality(&self, _: &fhir::SortCtor, args: &[fhir::Sort]) -> bool {
-        args.iter().all(|sort| self.has_equality(sort))
-    }
-
-    pub fn field_sort(
-        &self,
-        def_id: DefId,
-        sort_args: List<fhir::Sort>,
-        fld: Symbol,
-    ) -> Option<fhir::Sort> {
-        let def_id = self.lookup_extern(def_id).unwrap_or(def_id);
-        let poly_sort = if let Some(local_id) = def_id.as_local() {
-            self.map().refined_by(local_id).field_sort(fld, &sort_args)
-        } else {
-            self.cstore()
-                .refined_by(def_id)
-                .and_then(|refined_by| refined_by.field_sort(fld, &sort_args))
-        };
-        poly_sort
-    }
-
-    pub fn field_index(&self, def_id: DefId, fld: Symbol) -> Option<usize> {
-        let def_id = self.lookup_extern(def_id).unwrap_or(def_id);
-        if let Some(local_id) = def_id.as_local() {
-            self.map().refined_by(local_id).field_index(fld)
-        } else {
-            self.cstore()
-                .refined_by(def_id)
-                .and_then(|refined_by| refined_by.field_index(fld))
-        }
-    }
-
-    pub fn refine_default_generic_args(
-        &self,
-        generics: &rty::Generics,
-        args: &ty::GenericArgs,
-    ) -> QueryResult<rty::GenericArgs> {
-        let refiner = Refiner::default(self, generics);
-        let mut res = vec![];
-        for arg in args {
-            res.push(refiner.refine_generic_arg_raw(arg)?);
-        }
-        Ok(res.into())
+    pub fn def_id_to_param_index(&self, def_id: LocalDefId) -> u32 {
+        let item_def_id = self.hir().ty_param_owner(def_id);
+        let generics = self.tcx().generics_of(item_def_id);
+        generics.param_def_id_to_index[&def_id.to_def_id()]
     }
 
     pub fn refine_default(
-        &self,
+        self,
         generics: &rty::Generics,
         rustc_ty: &ty::Ty,
     ) -> QueryResult<rty::Ty> {
@@ -391,54 +338,176 @@ impl<'sess, 'tcx> GlobalEnv<'sess, 'tcx> {
     }
 
     pub fn refine_with_holes(
-        &self,
+        self,
         generics: &rty::Generics,
         rustc_ty: &ty::Ty,
     ) -> QueryResult<rty::Ty> {
         Refiner::with_holes(self, generics).refine_ty(rustc_ty)
     }
 
-    pub fn instantiate_arg_for_fun(
-        &self,
-        generics: &rty::Generics,
-        param: &rty::GenericParamDef,
-        arg: &ty::GenericArg,
-    ) -> QueryResult<rty::GenericArg> {
-        Refiner::new(self, generics, |bty| {
-            let sort = bty.sort();
-            let mut ty = rty::Ty::indexed(bty.shift_in_escaping(1), rty::Expr::nu());
-            if !sort.is_unit() {
-                ty = rty::Ty::constr(rty::Expr::hole(rty::HoleKind::Pred), ty);
-            }
-            rty::Binder::with_sort(ty, sort)
-        })
-        .refine_generic_arg(param, arg)
+    pub(crate) fn cstore(self) -> &'genv CrateStoreDyn {
+        &*self.inner.cstore
     }
 
-    pub fn instantiate_arg_for_constructor(
-        &self,
-        generics: &rty::Generics,
-        param: &rty::GenericParamDef,
-        arg: &ty::GenericArg,
-    ) -> QueryResult<rty::GenericArg> {
-        Refiner::with_holes(self, generics).refine_generic_arg(param, arg)
-    }
-
-    pub(crate) fn cstore(&self) -> &CrateStoreDyn {
-        &*self.cstore
-    }
-
-    pub fn hir(&self) -> rustc_middle::hir::map::Map<'tcx> {
-        self.tcx.hir()
-    }
-
-    pub(crate) fn lookup_extern(&self, def_id: DefId) -> Option<DefId> {
-        self.map().get_extern(def_id).map(LocalDefId::to_def_id)
-    }
-
-    pub(crate) fn is_fn_once_output(&self, def_id: DefId) -> bool {
-        self.tcx
+    pub fn is_fn_once_output(&self, def_id: DefId) -> bool {
+        self.tcx()
             .require_lang_item(rustc_hir::LangItem::FnOnceOutput, None)
             == def_id
+    }
+
+    pub fn extern_id_of(self, def_id: DefId) -> QueryResult<Option<DefId>> {
+        let Some(local_id) = def_id.as_local() else { return Ok(None) };
+        self.map().extern_id_of(local_id)
+    }
+
+    pub fn get_local_id_for_extern(self, extern_def_id: DefId) -> Option<LocalDefId> {
+        self.collect_specs()
+            .extern_specs
+            .get(&extern_def_id)
+            .copied()
+    }
+
+    /// transitively follows the parent-chain to find the first containing item with an explicit
+    /// `ignore` annotation and returns whether that item is ignored or not.
+    pub fn ignored(self, mut def_id: LocalDefId) -> Ignored {
+        loop {
+            if let Some(ignored) = self.ignores().get(&def_id) {
+                break *ignored;
+            }
+
+            if let Some(parent) = self.tcx().opt_local_parent(def_id) {
+                def_id = parent;
+            } else {
+                break Ignored::No;
+            }
+        }
+    }
+
+    fn ignores(self) -> &'genv UnordMap<LocalDefId, Ignored> {
+        &self.collect_specs().check_item
+    }
+
+    pub fn crate_config(self) -> Option<CrateConfig> {
+        self.collect_specs().crate_config
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Map<'genv, 'tcx> {
+    genv: GlobalEnv<'genv, 'tcx>,
+    fhir: &'genv fhir::Crate<'genv>,
+}
+
+impl<'genv, 'tcx> Map<'genv, 'tcx> {
+    fn new(genv: GlobalEnv<'genv, 'tcx>, fhir: &'genv fhir::Crate<'genv>) -> Self {
+        Self { genv, fhir }
+    }
+
+    pub fn get_generics(
+        self,
+        def_id: LocalDefId,
+    ) -> QueryResult<Option<&'genv fhir::Generics<'genv>>> {
+        // We don't have nodes for closures and coroutines
+        if matches!(self.genv.def_kind(def_id), DefKind::Closure) {
+            Ok(None)
+        } else {
+            Ok(Some(self.node(def_id)?.generics()))
+        }
+    }
+
+    pub fn get_flux_item(self, name: Symbol) -> Option<&'genv fhir::FluxItem<'genv>> {
+        self.fhir.flux_items.get(&name).as_ref().copied()
+    }
+
+    pub fn refined_by(self, def_id: LocalDefId) -> QueryResult<&'genv fhir::RefinedBy<'genv>> {
+        let refined_by = match &self.expect_item(def_id)?.kind {
+            fhir::ItemKind::Enum(enum_def) => enum_def.refined_by,
+            fhir::ItemKind::Struct(struct_def) => struct_def.refined_by,
+            fhir::ItemKind::TyAlias(ty_alias) => ty_alias.refined_by,
+            _ => bug!("expected struct, enum or type alias"),
+        };
+        Ok(refined_by)
+    }
+
+    pub fn extern_id_of(self, def_id: LocalDefId) -> QueryResult<Option<DefId>> {
+        Ok(self.node(def_id)?.extern_id())
+    }
+
+    pub fn spec_funcs(self) -> impl Iterator<Item = &'genv fhir::SpecFunc<'genv>> {
+        self.fhir.flux_items.values().filter_map(|item| {
+            if let fhir::FluxItem::Func(defn) = item {
+                Some(defn)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn spec_func(&self, name: Symbol) -> Option<&'genv fhir::SpecFunc<'genv>> {
+        self.fhir.flux_items.get(&name).and_then(|item| {
+            if let fhir::FluxItem::Func(defn) = item {
+                Some(defn)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn qualifiers(self) -> impl Iterator<Item = &'genv fhir::Qualifier<'genv>> {
+        self.fhir.flux_items.values().filter_map(|item| {
+            if let fhir::FluxItem::Qualifier(qual) = item {
+                Some(qual)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn consts(self) -> impl Iterator<Item = fhir::ConstInfo> + 'genv {
+        self.fhir.consts.values().copied()
+    }
+
+    pub fn is_trusted(self, def_id: LocalDefId) -> QueryResult<bool> {
+        Ok(self.node(def_id)?.fn_sig().unwrap().trusted)
+    }
+
+    pub fn fn_quals_for(self, def_id: LocalDefId) -> QueryResult<&'genv [fhir::SurfaceIdent]> {
+        // This is called on adts when checking invariants
+        if let Some(fn_sig) = self.node(def_id)?.fn_sig() {
+            Ok(fn_sig.qualifiers)
+        } else {
+            Ok(&[])
+        }
+    }
+
+    pub fn expect_item(self, def_id: LocalDefId) -> QueryResult<&'genv fhir::Item<'genv>> {
+        if let fhir::Node::Item(item) = self.node(def_id)? {
+            Ok(item)
+        } else {
+            bug!("expected item: `{def_id:?}`")
+        }
+    }
+
+    pub fn node(self, def_id: LocalDefId) -> QueryResult<fhir::Node<'genv>> {
+        self.genv.desugar(def_id)
+    }
+}
+
+#[macro_export]
+macro_rules! try_alloc_slice {
+    ($genv:expr, $slice:expr, $map:expr $(,)?) => {{
+        let slice = $slice;
+        $crate::try_alloc_slice!($genv, cap: slice.len(), slice.into_iter().map($map))
+    }};
+    ($genv:expr, cap: $cap:expr, $it:expr $(,)?) => {{
+        let mut err = None;
+        let slice = $genv.alloc_slice_with_capacity($cap, $it.into_iter().collect_errors(&mut err));
+        err.map_or(Ok(slice), Err)
+    }};
+}
+
+impl ErrorEmitter for GlobalEnv<'_, '_> {
+    fn emit<'a>(&'a self, err: impl rustc_errors::Diagnostic<'a>) -> rustc_span::ErrorGuaranteed {
+        self.sess().emit(err)
     }
 }

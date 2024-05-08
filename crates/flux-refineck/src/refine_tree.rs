@@ -4,14 +4,21 @@ use std::{
     rc::{Rc, Weak},
 };
 
-use flux_common::index::{IndexGen, IndexVec};
-use flux_middle::rty::{
-    box_args,
-    evars::EVarSol,
-    fold::{
-        TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitor,
+use flux_common::{
+    index::{IndexGen, IndexVec},
+    iter::IterExt,
+};
+use flux_middle::{
+    queries::QueryResult,
+    rty::{
+        box_args,
+        evars::EVarSol,
+        fold::{
+            TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable,
+            TypeVisitor,
+        },
+        BaseTy, Expr, GenericArg, Mutability, Name, Sort, Ty, TyKind,
     },
-    BaseTy, Expr, GenericArg, Mutability, Name, Sort, Ty, TyKind,
 };
 use itertools::Itertools;
 
@@ -120,19 +127,19 @@ impl RefineTree {
         RefineTree { root }
     }
 
-    pub(crate) fn as_subtree(&mut self) -> RefineSubtree {
-        RefineSubtree { root: NodePtr(Rc::clone(&self.root)), tree: self }
-    }
-
     pub(crate) fn simplify(&mut self) {
         self.root.borrow_mut().simplify();
     }
 
-    pub(crate) fn into_fixpoint(self, cx: &mut FixpointCtxt<Tag>) -> fixpoint::Constraint {
-        self.root
+    pub(crate) fn into_fixpoint(
+        self,
+        cx: &mut FixpointCtxt<Tag>,
+    ) -> QueryResult<fixpoint::Constraint> {
+        Ok(self
+            .root
             .borrow()
-            .to_fixpoint(cx)
-            .unwrap_or(fixpoint::Constraint::TRUE)
+            .to_fixpoint(cx)?
+            .unwrap_or(fixpoint::Constraint::TRUE))
     }
 
     pub(crate) fn refine_ctxt_at_root(&mut self) -> RefineCtxt {
@@ -181,7 +188,9 @@ impl<'rcx> RefineCtxt<'rcx> {
         self.snapshot().scope().unwrap()
     }
 
+    #[allow(dead_code)]
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) fn push_comment(&mut self, comment: impl ToString) -> RefineCtxt {
         let ptr = self.ptr.push_node(NodeKind::Comment(comment.to_string()));
         RefineCtxt { tree: self.tree, ptr }
@@ -195,14 +204,17 @@ impl<'rcx> RefineCtxt<'rcx> {
         fresh
     }
 
-    /// Given a [`sort`] that may contain nested tuples, it destructs the tuples recursively, generating
-    /// multiple fresh variables and returning the "eta-expanded" tuple of fresh variables. This is in contrast
-    /// to generating a single fresh variable of tuple sort.
+    /// Given a [`sort`] that may contain aggregate sorts ([tuple] or [adt]), it destructs the sort
+    /// recursively, generating multiple fresh variables and returning an "eta-expanded" expression
+    /// of fresh variables. This is in contrast to generating a single fresh variable of aggregate
+    /// sort.
     ///
     /// For example, given the sort `(int, (bool, int))` it returns `(a0, (a1, a2))` for fresh variables
     /// `a0: int`, `a1: bool`, and `a2: int`.
     ///
     /// [`sort`]: Sort
+    /// [tuple]: Sort::Tuple
+    /// [adt]: flux_middle::rty::SortCtor::Adt
     pub(crate) fn define_vars(&mut self, sort: &Sort) -> Expr {
         Expr::fold_sort(sort, |sort| Expr::fvar(self.define_var(sort)))
     }
@@ -224,12 +236,12 @@ impl<'rcx> RefineCtxt<'rcx> {
             .push_node(NodeKind::Head(pred2.into(), tag));
     }
 
-    pub(crate) fn unpack(&mut self, ty: &Ty, assume_invariants: AssumeInvariants) -> Ty {
-        self.unpacker(assume_invariants).unpack(ty)
+    pub(crate) fn unpack(&mut self, ty: &Ty) -> Ty {
+        self.unpacker().unpack(ty)
     }
 
-    pub(crate) fn unpacker(&mut self, assume_invariants: AssumeInvariants) -> Unpacker<'_, 'rcx> {
-        Unpacker::new(self, assume_invariants)
+    pub(crate) fn unpacker(&mut self) -> Unpacker<'_, 'rcx> {
+        Unpacker::new(self)
     }
 
     pub(crate) fn assume_invariants(&mut self, ty: &Ty, overflow_checking: bool) {
@@ -238,7 +250,7 @@ impl<'rcx> RefineCtxt<'rcx> {
             overflow_checking: bool,
         }
         impl TypeVisitor for Visitor<'_, '_> {
-            fn visit_bty(&mut self, bty: &BaseTy) -> ControlFlow<!, ()> {
+            fn visit_bty(&mut self, bty: &BaseTy) -> ControlFlow<!> {
                 match bty {
                     BaseTy::Adt(adt_def, substs) if adt_def.is_box() => substs.visit_with(self),
                     BaseTy::Ref(_, ty, _) => ty.visit_with(self),
@@ -247,13 +259,13 @@ impl<'rcx> RefineCtxt<'rcx> {
                 }
             }
 
-            fn visit_ty(&mut self, ty: &Ty) -> ControlFlow<!, ()> {
+            fn visit_ty(&mut self, ty: &Ty) -> ControlFlow<!> {
                 if let TyKind::Indexed(bty, idx) = ty.kind()
                     && !idx.has_escaping_bvars()
                 {
                     for invariant in bty.invariants(self.overflow_checking) {
-                        let invariant = invariant.pred.replace_bound_expr(&idx.expr);
-                        self.rcx.assume_pred(invariant);
+                        let invariant = invariant.apply(idx);
+                        self.rcx.assume_pred(&invariant);
                     }
                 }
                 ty.super_visit_with(self)
@@ -267,6 +279,11 @@ impl<'rcx> RefineCtxt<'rcx> {
     }
 }
 
+enum AssumeInvariants {
+    Yes { check_overflow: bool },
+    No,
+}
+
 pub(crate) struct Unpacker<'a, 'rcx> {
     rcx: &'a mut RefineCtxt<'rcx>,
     in_mut_ref: bool,
@@ -276,27 +293,21 @@ pub(crate) struct Unpacker<'a, 'rcx> {
     assume_invariants: AssumeInvariants,
 }
 
-pub(crate) enum AssumeInvariants {
-    Yes { check_overflow: bool },
-    No,
-}
-
-impl AssumeInvariants {
-    pub(crate) fn yes(check_overflow: bool) -> Self {
-        Self::Yes { check_overflow }
-    }
-}
-
 impl<'a, 'rcx> Unpacker<'a, 'rcx> {
-    fn new(rcx: &'a mut RefineCtxt<'rcx>, assume_invariants: AssumeInvariants) -> Self {
+    fn new(rcx: &'a mut RefineCtxt<'rcx>) -> Self {
         Self {
             rcx,
             in_mut_ref: false,
             unpack_inside_mut_ref: false,
             shallow: false,
             unpack_exists: true,
-            assume_invariants,
+            assume_invariants: AssumeInvariants::No,
         }
+    }
+
+    pub(crate) fn assume_invariants(mut self, check_overflow: bool) -> Self {
+        self.assume_invariants = AssumeInvariants::Yes { check_overflow };
+        self
     }
 
     pub(crate) fn unpack_inside_mut_ref(mut self, unpack_inside_mut_ref: bool) -> Self {
@@ -322,7 +333,7 @@ impl<'a, 'rcx> Unpacker<'a, 'rcx> {
 impl TypeFolder for Unpacker<'_, '_> {
     fn fold_ty(&mut self, ty: &Ty) -> Ty {
         match ty.kind() {
-            TyKind::Indexed(bty, idxs) => Ty::indexed(bty.fold_with(self), idxs.clone()),
+            TyKind::Indexed(bty, idx) => Ty::indexed(bty.fold_with(self), idx.clone()),
             TyKind::Exists(bound_ty) if self.unpack_exists => {
                 // HACK(nilehmann) In general we shouldn't unpack through mutable references because
                 // that makes referent type too specific. We only have this as a workaround to infer
@@ -330,7 +341,7 @@ impl TypeFolder for Unpacker<'_, '_> {
                 // opening of mutable references. See also `ConstrGen::check_fn_call`.
                 if !self.in_mut_ref || self.unpack_inside_mut_ref {
                     let bound_ty = bound_ty
-                        .replace_bound_exprs_with(|sort, _| self.rcx.define_vars(sort))
+                        .replace_bound_refts_with(|sort, _, _| self.rcx.define_vars(sort))
                         .fold_with(self);
                     if let AssumeInvariants::Yes { check_overflow } = self.assume_invariants {
                         self.rcx.assume_invariants(&bound_ty, check_overflow);
@@ -341,7 +352,7 @@ impl TypeFolder for Unpacker<'_, '_> {
                 }
             }
             TyKind::Constr(pred, ty) => {
-                self.rcx.assume_pred(pred);
+                self.rcx.assume_pred(pred.clone());
                 ty.fold_with(self)
             }
             TyKind::Downcast(..) if !self.shallow => ty.super_fold_with(self),
@@ -528,35 +539,47 @@ impl Node {
         }
     }
 
-    fn to_fixpoint(&self, cx: &mut FixpointCtxt<Tag>) -> Option<fixpoint::Constraint> {
-        match &self.kind {
+    fn to_fixpoint(&self, cx: &mut FixpointCtxt<Tag>) -> QueryResult<Option<fixpoint::Constraint>> {
+        let cstr = match &self.kind {
             NodeKind::Comment(_) | NodeKind::Conj | NodeKind::ForAll(_, Sort::Loc) => {
-                children_to_fixpoint(cx, &self.children)
+                children_to_fixpoint(cx, &self.children)?
             }
             NodeKind::ForAll(name, sort) => {
-                cx.with_name_map(*name, |cx, fresh| {
-                    Some(fixpoint::Constraint::ForAll(
-                        fixpoint::Var::Local(fresh),
-                        sort_to_fixpoint(sort),
-                        fixpoint::Pred::TRUE,
-                        Box::new(children_to_fixpoint(cx, &self.children)?),
-                    ))
-                })
+                cx.with_name_map(*name, |cx, fresh| -> QueryResult<_> {
+                    let Some(children) = children_to_fixpoint(cx, &self.children)? else {
+                        return Ok(None);
+                    };
+                    Ok(Some(fixpoint::Constraint::ForAll(
+                        fixpoint::Bind {
+                            name: fixpoint::Var::Local(fresh),
+                            sort: sort_to_fixpoint(sort),
+                            pred: fixpoint::Pred::TRUE,
+                        },
+                        Box::new(children),
+                    )))
+                })?
             }
             NodeKind::Guard(pred) => {
-                let (bindings, preds) = cx.pred_to_fixpoint(pred);
+                let (bindings, preds) = cx.pred_to_fixpoint(pred)?;
                 let preds = preds.into_iter().map(|(pred, _)| pred).collect_vec();
                 let pred = fixpoint::Pred::And(preds);
+                let Some(children) = children_to_fixpoint(cx, &self.children)? else {
+                    return Ok(None);
+                };
                 Some(stitch(
                     bindings,
-                    fixpoint::Constraint::Guard(
-                        pred,
-                        Box::new(children_to_fixpoint(cx, &self.children)?),
+                    fixpoint::Constraint::ForAll(
+                        fixpoint::Bind {
+                            name: fixpoint::Var::Underscore,
+                            sort: fixpoint::Sort::Int,
+                            pred,
+                        },
+                        Box::new(children),
                     ),
                 ))
             }
             NodeKind::Head(pred, tag) => {
-                let (bindings, preds) = cx.pred_to_fixpoint(pred);
+                let (bindings, preds) = cx.pred_to_fixpoint(pred)?;
                 let cstr = preds
                     .into_iter()
                     .map(|(pred, span)| {
@@ -566,7 +589,8 @@ impl Node {
                 Some(stitch(bindings, fixpoint::Constraint::Conj(cstr)))
             }
             NodeKind::True => None,
-        }
+        };
+        Ok(cstr)
     }
 
     /// Returns `true` if the node kind is [`ForAll`].
@@ -587,16 +611,17 @@ impl Node {
 fn children_to_fixpoint(
     cx: &mut FixpointCtxt<Tag>,
     children: &[NodePtr],
-) -> Option<fixpoint::Constraint> {
+) -> QueryResult<Option<fixpoint::Constraint>> {
     let mut children = children
         .iter()
-        .filter_map(|node| node.borrow().to_fixpoint(cx))
-        .collect_vec();
-    match children.len() {
+        .filter_map(|node| node.borrow().to_fixpoint(cx).transpose())
+        .try_collect_vec()?;
+    let cstr = match children.len() {
         0 => None,
         1 => children.pop(),
         _ => Some(fixpoint::Constraint::Conj(children)),
-    }
+    };
+    Ok(cstr)
 }
 
 struct ParentsIter {
@@ -622,6 +647,27 @@ impl Iterator for ParentsIter {
     }
 }
 
+impl TypeVisitable for RefineTree {
+    fn visit_with<V: TypeVisitor>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        self.root.visit_with(visitor)
+    }
+}
+
+impl TypeVisitable for NodePtr {
+    fn visit_with<V: TypeVisitor>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        let node = self.borrow();
+        match &node.kind {
+            NodeKind::Conj | NodeKind::Comment(_) | NodeKind::True => {}
+            NodeKind::Guard(pred) | NodeKind::Head(pred, _) => pred.visit_with(visitor)?,
+            NodeKind::ForAll(_, sort) => sort.visit_with(visitor)?,
+        }
+        for child in &node.children {
+            child.visit_with(visitor)?;
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 mod pretty {
     use std::{
         fmt::{self, Write},
@@ -630,7 +676,6 @@ mod pretty {
 
     use flux_common::format::PadAdapter;
     use flux_middle::pretty::*;
-    use itertools::Itertools;
 
     use super::*;
 
@@ -687,21 +732,21 @@ mod pretty {
     }
 
     impl Pretty for RefineTree {
-        fn fmt(&self, cx: &PPrintCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt(&self, cx: &PrettyCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             define_scoped!(cx, f);
             w!("{:?}", &self.root)
         }
     }
 
     impl Pretty for RefineSubtree<'_> {
-        fn fmt(&self, cx: &PPrintCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt(&self, cx: &PrettyCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             define_scoped!(cx, f);
             w!("{:?}", &self.root)
         }
     }
 
     impl Pretty for NodePtr {
-        fn fmt(&self, cx: &PPrintCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt(&self, cx: &PrettyCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             define_scoped!(cx, f);
             let node = self.borrow();
             match &node.kind {
@@ -757,7 +802,7 @@ mod pretty {
 
     fn fmt_children(
         children: &[NodePtr],
-        cx: &PPrintCx,
+        cx: &PrettyCx,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
         let mut f = PadAdapter::wrap_fmt(f, 2);
@@ -778,7 +823,7 @@ mod pretty {
     }
 
     impl Pretty for RefineCtxt<'_> {
-        fn fmt(&self, cx: &PPrintCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt(&self, cx: &PrettyCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             define_scoped!(cx, f);
             let parents = ParentsIter::new(NodePtr::clone(&self.ptr)).collect_vec();
             write!(
@@ -810,7 +855,7 @@ mod pretty {
     }
 
     impl Pretty for Scope {
-        fn fmt(&self, cx: &PPrintCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt(&self, cx: &PrettyCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             define_scoped!(cx, f);
             write!(
                 f,

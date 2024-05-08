@@ -1,9 +1,8 @@
-use std::{
-    convert::Infallible,
-    ops::{ControlFlow, FromResidual, Try},
-};
+use std::ops::Try;
 
 use rustc_errors::ErrorGuaranteed;
+
+use crate::result::ErrorCollector;
 
 pub trait IterExt: Iterator {
     fn try_collect_vec<T, E>(self) -> Result<Vec<T>, E>
@@ -13,22 +12,21 @@ pub trait IterExt: Iterator {
         self.collect()
     }
 
+    fn collect_errors<T, E, C>(self, collector: &mut C) -> CollectErrors<Self, C>
+    where
+        Self: Iterator<Item = Result<T, E>> + Sized,
+        C: ErrorCollector<E>,
+    {
+        CollectErrors { iter: self, collector }
+    }
+
     fn try_collect_exhaust<T, V>(self) -> Result<V, ErrorGuaranteed>
     where
         V: FromIterator<T>,
         Self: Iterator<Item = Result<T, ErrorGuaranteed>> + Sized,
     {
         let mut acc: Option<ErrorGuaranteed> = None;
-        let v = ReportResiduals {
-            iter: self,
-            f: |residual: Result<Infallible, ErrorGuaranteed>| {
-                match acc.take() {
-                    Some(e) => acc = Some(e),
-                    None => acc = Some(residual.unwrap_err()),
-                }
-            },
-        }
-        .collect();
+        let v = self.collect_errors(&mut acc).collect();
         match acc {
             Some(e) => Err(e),
             None => Ok(v),
@@ -43,10 +41,7 @@ pub trait IterExt: Iterator {
         let mut acc: Option<ErrorGuaranteed> = None;
         for v in self {
             if let Err(e) = f(v) {
-                match acc.take() {
-                    Some(_) => acc = Some(e),
-                    None => acc = Some(e),
-                }
+                acc = Some(e).or(acc);
             }
         }
         match acc {
@@ -66,16 +61,15 @@ pub trait IterExt: Iterator {
 
 impl<I: ?Sized> IterExt for I where I: Iterator {}
 
-struct ReportResiduals<I, F> {
+pub struct CollectErrors<'a, I, C> {
     iter: I,
-    f: F,
+    collector: &'a mut C,
 }
 
-impl<I, T, E, F, R> Iterator for ReportResiduals<I, F>
+impl<I, T, E, F> Iterator for CollectErrors<'_, I, F>
 where
-    I: Iterator<Item = R>,
-    R: Try<Output = T, Residual = E> + FromResidual<E>,
-    F: FnMut(E),
+    I: Iterator<Item = Result<T, E>>,
+    F: ErrorCollector<E>,
 {
     type Item = T;
 
@@ -89,10 +83,10 @@ where
         R2: Try<Output = B>,
     {
         self.iter.try_fold(init, |acc, x| {
-            match x.branch() {
-                ControlFlow::Continue(x) => f(acc, x),
-                ControlFlow::Break(e) => {
-                    (self.f)(e);
+            match x {
+                Ok(x) => f(acc, x),
+                Err(e) => {
+                    self.collector.collect_err(e);
                     try { acc }
                 }
             }

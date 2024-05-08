@@ -65,6 +65,22 @@ impl ParseSess {
         parse!(self, grammar::FnSigParser, tokens, span)
     }
 
+    pub fn parse_trait_assoc_reft(
+        &mut self,
+        tokens: &TokenStream,
+        span: Span,
+    ) -> ParseResult<surface::TraitAssocReft> {
+        parse!(self, grammar::TraitAssocReftParser, tokens, span)
+    }
+
+    pub fn parse_impl_assoc_reft(
+        &mut self,
+        tokens: &TokenStream,
+        span: Span,
+    ) -> ParseResult<surface::ImplAssocReft> {
+        parse!(self, grammar::ImplAssocReftParser, tokens, span)
+    }
+
     pub fn parse_qual_names(
         &mut self,
         tokens: &TokenStream,

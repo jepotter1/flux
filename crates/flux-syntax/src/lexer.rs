@@ -32,6 +32,7 @@ pub enum Token {
     Ge,
     At,
     Pound,
+    Underscore,
     Fn,
     Async,
     Iff,
@@ -56,7 +57,7 @@ pub enum Token {
     Check,
     If,
     Else,
-    ModSep,
+    PathSep,
     Qualifier,
     Sort,
     Opaque,
@@ -162,6 +163,7 @@ impl<'t> Cursor<'t> {
             TokenKind::Ident(symb, _) if symb == kw::Else => Token::Else,
             TokenKind::Ident(symb, _) if symb == kw::Async => Token::Async,
             TokenKind::Ident(symb, _) if symb == kw::As => Token::As,
+            TokenKind::Ident(symb, _) if symb == kw::Underscore => Token::Underscore,
             TokenKind::Ident(symb, _) => Token::Ident(symb),
             TokenKind::BinOp(BinOpToken::Or) => Token::Caret,
             TokenKind::BinOp(BinOpToken::Plus) => Token::Plus,
@@ -176,7 +178,7 @@ impl<'t> Cursor<'t> {
                 return;
             }
             TokenKind::Not => Token::Not,
-            TokenKind::ModSep => Token::ModSep,
+            TokenKind::PathSep => Token::PathSep,
             _ => Token::Invalid,
         };
         self.push_token(span.lo(), token, span.hi());
@@ -206,7 +208,7 @@ impl<'t> Cursor<'t> {
                 }
                 self.map_token(token);
             }
-            Some(TokenTree::Delimited(span, delim, tokens)) => {
+            Some(TokenTree::Delimited(span, _spacing, delim, tokens)) => {
                 let close = (
                     Location(span.close.lo() - self.offset),
                     Token::CloseDelim(*delim),

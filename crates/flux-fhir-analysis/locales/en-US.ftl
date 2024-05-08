@@ -80,13 +80,10 @@ fhir_analysis_expected_numeric =
 fhir_analysis_no_equality =
     values of sort `{$sort}` cannot be compared for equality
 
-fhir_analysis_invalid_base_instance =
-    values of this type cannot be used as base sorted instances
-
 fhir_analysis_param_not_determined =
-    parameter `{$sym}` cannot be determined
+    parameter `{$name}` cannot be determined
     .label = undetermined parameter
-    .help = try indexing a type with `{$sym}` in a position that fully determines its value
+    .help = try indexing a type with `{$name}` in a position that fully determines its value
 
 fhir_analysis_sort_annotation_needed =
     sort annotation needed
@@ -96,6 +93,10 @@ fhir_analysis_cannot_infer_sort =
     sort annotation needed
     .label = cannot infer sort
     .note = sort must be known at this point
+
+
+fhir_analysis_refined_unrefinable_type =
+    type cannot be refined
 
 # Annot check
 
@@ -160,4 +161,16 @@ fhir_analysis_definition_cycle =
 fhir_analysis_assoc_type_not_found =
     associated type not found
     .label = cannot resolve this associated type
-    .note = flux cannot resolved associated types if they are defined in a super trait
+    .note = Flux cannot resolved associated types if they are defined in a super trait
+
+fhir_analysis_invalid_base_instance =
+    values of this type cannot be used as base sorted instances
+
+# Check impl against trait errors
+
+fhir_analysis_incompatible_sort =
+    implemented associated refinement `{$name}` has an incompatible sort for trait
+    .label = expected `{$expected}`, found `{$found}`
+
+fhir_analysis_invalid_assoc_reft =
+    associated refinement `{$name}` is not a member of trait `{$trait_}`

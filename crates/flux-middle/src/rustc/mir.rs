@@ -8,7 +8,7 @@ use flux_common::{
 };
 use itertools::Itertools;
 pub use rustc_borrowck::borrow_set::BorrowData;
-use rustc_borrowck::consumers::{BodyWithBorrowckFacts, BorrowIndex, RegionInferenceContext};
+use rustc_borrowck::consumers::{BodyWithBorrowckFacts, BorrowIndex};
 use rustc_data_structures::{fx::FxIndexMap, graph::dominators::Dominators};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_index::IndexSlice;
@@ -83,7 +83,7 @@ pub struct BasicBlockData<'tcx> {
 
 pub type LocalDecls = IndexSlice<Local, LocalDecl>;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LocalDecl {
     pub ty: Ty,
     pub source_info: SourceInfo,
@@ -321,11 +321,6 @@ impl<'tcx> Body<'tcx> {
         &self.body_with_facts.body
     }
 
-    /// see (NOTE:YIELD)
-    pub fn resume_local(&self) -> Option<Local> {
-        self.args_iter().nth(1)
-    }
-
     #[inline]
     pub fn args_iter(&self) -> impl ExactSizeIterator<Item = Local> {
         (1..self.body_with_facts.body.arg_count + 1).map(Local::new)
@@ -364,10 +359,6 @@ impl<'tcx> Body<'tcx> {
         )
     }
 
-    pub fn region_inference_context(&self) -> &RegionInferenceContext<'tcx> {
-        &self.body_with_facts.region_inference_context
-    }
-
     pub fn borrow_data(&self, idx: BorrowIndex) -> &BorrowData<'tcx> {
         self.body_with_facts
             .borrow_set
@@ -393,7 +384,7 @@ impl Place {
         Place { local, projection }
     }
 
-    pub fn ty(&self, genv: &GlobalEnv, local_decls: &LocalDecls) -> QueryResult<PlaceTy> {
+    pub fn ty(&self, genv: GlobalEnv, local_decls: &LocalDecls) -> QueryResult<PlaceTy> {
         self.projection
             .iter()
             .try_fold(PlaceTy::from_ty(local_decls[self.local].ty.clone()), |place_ty, elem| {
@@ -401,7 +392,7 @@ impl Place {
             })
     }
 
-    pub fn behind_raw_ptr(&self, genv: &GlobalEnv, local_decls: &LocalDecls) -> QueryResult<bool> {
+    pub fn behind_raw_ptr(&self, genv: GlobalEnv, local_decls: &LocalDecls) -> QueryResult<bool> {
         let mut place_ty = PlaceTy::from_ty(local_decls[self.local].ty.clone());
         for elem in &self.projection {
             if let (PlaceElem::Deref, TyKind::RawPtr(..)) = (elem, place_ty.ty.kind()) {
@@ -418,7 +409,7 @@ impl PlaceTy {
         PlaceTy { ty, variant_index: None }
     }
 
-    fn projection_ty(&self, genv: &GlobalEnv, elem: PlaceElem) -> QueryResult<PlaceTy> {
+    fn projection_ty(&self, genv: GlobalEnv, elem: PlaceElem) -> QueryResult<PlaceTy> {
         if self.variant_index.is_some() && !matches!(elem, PlaceElem::Field(..)) {
             bug!("cannot use non field projection on downcasted place");
         }
@@ -439,7 +430,7 @@ impl PlaceTy {
         Ok(place_ty)
     }
 
-    fn field_ty(&self, genv: &GlobalEnv, f: FieldIdx) -> QueryResult<Ty> {
+    fn field_ty(&self, genv: GlobalEnv, f: FieldIdx) -> QueryResult<Ty> {
         match self.ty.kind() {
             TyKind::Adt(adt_def, args) => {
                 let variant_def = match self.variant_index {
@@ -455,15 +446,6 @@ impl PlaceTy {
             }
             TyKind::Tuple(tys) => Ok(tys[f.index()].clone()),
             _ => bug!("extracting field of non-tuple non-adt: {self:?}"),
-        }
-    }
-}
-
-impl PlaceElem {
-    pub fn as_field(&self) -> Option<FieldIdx> {
-        match self {
-            PlaceElem::Field(field) => Some(*field),
-            _ => None,
         }
     }
 }
@@ -673,7 +655,7 @@ impl fmt::Debug for Rvalue {
                 if !args.is_empty() {
                     write!(f, "<{:?}>", args.iter().format(", "),)?;
                 }
-                if !args.is_empty() {
+                if !operands.is_empty() {
                     write!(f, "({:?})", operands.iter().format(", "))?;
                 }
                 Ok(())

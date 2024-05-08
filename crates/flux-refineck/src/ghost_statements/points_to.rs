@@ -44,7 +44,7 @@ use crate::ghost_statements::{GhostStatement, Point};
 
 pub(crate) fn add_ghost_statements<'tcx>(
     stmts: &mut GhostStatements,
-    genv: &GlobalEnv<'_, 'tcx>,
+    genv: GlobalEnv<'_, 'tcx>,
     body: &mir::Body<'tcx>,
     def_id: LocalDefId,
 ) -> QueryResult {
@@ -54,10 +54,10 @@ pub(crate) fn add_ghost_statements<'tcx>(
 
     // We have fn_sig for function items, but not for closures or generators.
     let fn_sig =
-        if genv.tcx.def_kind(def_id) == DefKind::Fn { Some(genv.fn_sig(def_id)?) } else { None };
+        if genv.def_kind(def_id) == DefKind::Fn { Some(genv.fn_sig(def_id)?) } else { None };
 
     PointsToAnalysis::new(&map, fn_sig)
-        .into_engine(genv.tcx, body)
+        .into_engine(genv.tcx(), body)
         .iterate_to_fixpoint()
         .visit_reachable_with(body, &mut visitor);
 
@@ -261,14 +261,14 @@ impl<'tcx> rustc_mir_dataflow::Analysis<'tcx> for PointsToAnalysis<'_> {
 
 struct CollectPointerToBorrows<'a> {
     map: &'a Map,
-    tracked_places: Vec<(PlaceIndex, flux_middle::rustc::mir::Place)>,
+    tracked_places: FxHashMap<PlaceIndex, flux_middle::rustc::mir::Place>,
     stmts: &'a mut GhostStatements,
-    before_assign: Option<State>,
+    before_state: Vec<(PlaceIndex, FlatSet<Loc>)>,
 }
 
 impl<'a> CollectPointerToBorrows<'a> {
     fn new(map: &'a Map, stmts: &'a mut GhostStatements) -> Self {
-        let mut tracked_places = vec![];
+        let mut tracked_places = FxHashMap::default();
         map.for_each_tracked_place(|place_idx, local, projection| {
             let projection = projection
                 .iter()
@@ -276,39 +276,20 @@ impl<'a> CollectPointerToBorrows<'a> {
                 .map(flux_middle::rustc::mir::PlaceElem::Field)
                 .collect();
             tracked_places
-                .push((place_idx, flux_middle::rustc::mir::Place::new(local, projection)));
+                .insert(place_idx, flux_middle::rustc::mir::Place::new(local, projection));
         });
-        Self { map, tracked_places, stmts, before_assign: None }
-    }
-
-    fn insert_ptr_to_borrows_at(&mut self, point: Point, old: &State, new: &State) {
-        for (place_idx, place) in &self.tracked_places {
-            let old_value = old.get_idx(*place_idx, self.map);
-            let new_value = new.get_idx(*place_idx, self.map);
-            if let (FlatSet::Elem(_), FlatSet::Top) = (old_value, new_value) {
-                self.stmts
-                    .insert_at(point, GhostStatement::PtrToBorrow(place.clone()));
-            }
-        }
+        Self { map, tracked_places, stmts, before_state: vec![] }
     }
 }
 
 impl<'a, 'mir, 'tcx> ResultsVisitor<'mir, 'tcx, Results<'a, 'tcx>> for CollectPointerToBorrows<'_> {
     type FlowState = State;
 
-    fn visit_statement_before_primary_effect(
-        &mut self,
-        _results: &mut Results<'a, 'tcx>,
-        state: &Self::FlowState,
-        statement: &'mir mir::Statement<'tcx>,
-        _location: mir::Location,
-    ) {
-        if let mir::StatementKind::Assign(box (target, _)) = statement.kind
-            && self.map.locals[target.local].is_some()
-        {
-            self.before_assign = Some(state.clone());
-        } else {
-            self.before_assign = None;
+    fn visit_block_start(&mut self, state: &Self::FlowState) {
+        self.before_state.clear();
+        for place_idx in self.tracked_places.keys() {
+            let value = state.get_idx(*place_idx, self.map);
+            self.before_state.push((*place_idx, value));
         }
     }
 
@@ -316,31 +297,46 @@ impl<'a, 'mir, 'tcx> ResultsVisitor<'mir, 'tcx, Results<'a, 'tcx>> for CollectPo
         &mut self,
         _results: &mut Results<'a, 'tcx>,
         state: &Self::FlowState,
-        statement: &'mir mir::Statement<'tcx>,
+        _statement: &'mir mir::Statement<'tcx>,
         location: mir::Location,
     ) {
-        if let mir::StatementKind::Assign(..) = statement.kind
-            && let Some(old_state) = self.before_assign.take()
-        {
-            self.insert_ptr_to_borrows_at(Point::Location(location), &old_state, state);
+        let point = Point::Location(location);
+        for (place_idx, old_value) in &mut self.before_state {
+            let new_value = state.get_idx(*place_idx, self.map);
+            if let (FlatSet::Elem(_), FlatSet::Top) = (&old_value, &new_value) {
+                let place = self.tracked_places.get(place_idx).unwrap().clone();
+                self.stmts
+                    .insert_at(point, GhostStatement::PtrToBorrow(place));
+            }
+            *old_value = new_value;
         }
     }
 
-    fn visit_block_end(
+    fn visit_terminator_after_primary_effect(
         &mut self,
         results: &mut Results<'a, 'tcx>,
-        state: &State,
-        block_data: &'mir mir::BasicBlockData<'tcx>,
-        block: BasicBlock,
+        _state: &Self::FlowState,
+        terminator: &'mir mir::Terminator<'tcx>,
+        location: mir::Location,
     ) {
-        for target in block_data.terminator().successors() {
+        let block = location.block;
+        for target in terminator.successors() {
+            let point = Point::Edge(block, target);
             let target_state = results.entry_set_for_block(target);
-            self.insert_ptr_to_borrows_at(Point::Edge(block, target), state, target_state);
+
+            for (place_idx, old_value) in &self.before_state {
+                let new_value = target_state.get_idx(*place_idx, self.map);
+                if let (FlatSet::Elem(_), FlatSet::Top) = (&old_value, new_value) {
+                    let place = self.tracked_places.get(place_idx).unwrap().clone();
+                    self.stmts
+                        .insert_at(point, GhostStatement::PtrToBorrow(place));
+                }
+            }
         }
     }
 }
 
-/// Partial mapping from [`Place`] to [`PlaceIndex`], where some places also have a [`ValueIndex`].
+/// Partial mapping from `Place` to [`PlaceIndex`], where some places also have a [`ValueIndex`].
 ///
 /// This data structure essentially maintains a tree of places and their projections. Some
 /// additional bookkeeping is done, to speed up traversal over this tree:
@@ -680,33 +676,7 @@ impl PlaceOrValue {
     const TOP: Self = PlaceOrValue::Value(FlatSet::TOP);
 }
 
-/// See [`State`].
-#[derive(PartialEq, Eq, Debug)]
-enum StateData {
-    Reachable(IndexVec<ValueIndex, FlatSet<Loc>>),
-    Unreachable,
-}
-
-impl Clone for StateData {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Reachable(x) => Self::Reachable(x.clone()),
-            Self::Unreachable => Self::Unreachable,
-        }
-    }
-
-    fn clone_from(&mut self, source: &Self) {
-        match (&mut *self, source) {
-            (Self::Reachable(x), Self::Reachable(y)) => {
-                // We go through `raw` here, because `IndexVec` currently has a naive `clone_from`.
-                x.raw.clone_from(&y.raw);
-            }
-            _ => *self = source.clone(),
-        }
-    }
-}
-
-/// The dataflow state for an instance of [`ValueAnalysis`].
+/// The dataflow state for the [`PointsToAnalysis`].
 ///
 /// Every instance specifies a lattice that represents the possible values of a single tracked
 /// place. If we call this lattice `V` and set of tracked places `P`, then a [`State`] is an

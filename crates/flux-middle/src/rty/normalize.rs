@@ -7,34 +7,34 @@ use toposort_scc::IndexGraph;
 
 use super::{fold::TypeSuperFoldable, ESpan};
 use crate::{
-    fhir::FuncKind,
+    fhir::SpecFuncKind,
     rty::{
         fold::{TypeFoldable, TypeFolder, TypeSuperVisitable, TypeVisitable, TypeVisitor},
-        Binder, Defn, Expr, ExprKind,
+        Binder, Expr, ExprKind, SpecFunc,
     },
 };
 
 #[derive(Default)]
-pub struct Defns {
-    defns: FxHashMap<Symbol, Defn>,
+pub struct SpecFuncDefns {
+    defns: FxHashMap<Symbol, SpecFunc>,
 }
 
 pub(super) struct Normalizer<'a> {
-    defs: &'a Defns,
+    defs: &'a SpecFuncDefns,
 }
 
-impl Defns {
-    pub fn new(defns: FxHashMap<Symbol, Defn>) -> Result<Self, Vec<Symbol>> {
-        let raw = Defns { defns };
+impl SpecFuncDefns {
+    pub fn new(defns: FxHashMap<Symbol, SpecFunc>) -> Result<Self, Vec<Symbol>> {
+        let raw = SpecFuncDefns { defns };
         raw.normalize()
     }
 
     fn defn_deps(&self, expr: &Binder<Expr>) -> FxHashSet<Symbol> {
         struct DepsVisitor(FxHashSet<Symbol>);
         impl TypeVisitor for DepsVisitor {
-            fn visit_expr(&mut self, expr: &Expr) -> ControlFlow<!, ()> {
+            fn visit_expr(&mut self, expr: &Expr) -> ControlFlow<!> {
                 if let ExprKind::App(func, _) = expr.kind()
-                    && let ExprKind::GlobalFunc(sym, FuncKind::Def) = func.kind()
+                    && let ExprKind::GlobalFunc(sym, SpecFuncKind::Def) = func.kind()
                 {
                     self.0.insert(*sym);
                 }
@@ -91,24 +91,24 @@ impl Defns {
         let ds = self.sorted_defns()?;
 
         // 2. Expand each defn in the sorted order
-        let mut exp_defns = Defns { defns: FxHashMap::default() };
+        let mut exp_defns = SpecFuncDefns { defns: FxHashMap::default() };
         for d in ds {
             if let Some(defn) = self.defns.remove(&d) {
                 let expr = defn.expr.normalize(&exp_defns);
-                let exp_defn = Defn { expr, ..defn };
+                let exp_defn = SpecFunc { expr, ..defn };
                 exp_defns.defns.insert(d, exp_defn);
             }
         }
         Ok(exp_defns)
     }
 
-    fn func_defn(&self, f: &Symbol) -> Option<&Defn> {
+    fn func_defn(&self, f: &Symbol) -> Option<&SpecFunc> {
         self.defns.get(f)
     }
 }
 
 impl<'a> Normalizer<'a> {
-    pub(super) fn new(defs: &'a Defns) -> Self {
+    pub(super) fn new(defs: &'a SpecFuncDefns) -> Self {
         Self { defs }
     }
 
@@ -121,25 +121,17 @@ impl<'a> Normalizer<'a> {
 
     fn app(&mut self, func: &Expr, args: &[Expr], espan: Option<ESpan>) -> Expr {
         match func.kind() {
-            ExprKind::GlobalFunc(sym, FuncKind::Def)
+            ExprKind::GlobalFunc(sym, SpecFuncKind::Def)
                 if let Some(defn) = self.defs.func_defn(sym) =>
             {
-                let res = defn.expr.replace_bound_exprs(args);
+                let res = defn.expr.replace_bound_refts(args);
                 Self::at_base(res, espan)
             }
-            ExprKind::Abs(body) => {
-                let res = body.replace_bound_exprs(args);
+            ExprKind::Abs(lam) => {
+                let res = lam.apply(args);
                 Self::at_base(res, espan)
             }
             _ => Expr::app(func.clone(), args, espan),
-        }
-    }
-
-    fn tuple_proj(&self, tup: &Expr, proj: u32) -> Expr {
-        if let ExprKind::Tuple(exprs) = tup.kind() {
-            exprs[proj as usize].clone()
-        } else {
-            Expr::tuple_proj(tup, proj, None)
         }
     }
 }
@@ -150,8 +142,7 @@ impl TypeFolder for Normalizer<'_> {
         let span = expr.span();
         match expr.kind() {
             ExprKind::App(func, args) => self.app(func, args, span),
-
-            ExprKind::TupleProj(tup, proj) => self.tuple_proj(tup, *proj),
+            ExprKind::FieldProj(e, proj) => e.proj_and_reduce(*proj),
             _ => expr,
         }
     }

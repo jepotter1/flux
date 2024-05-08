@@ -1,25 +1,29 @@
+use flux_errors::E0999;
 use flux_macros::Diagnostic;
-use flux_middle::fhir::{self, SurfaceIdent};
+use flux_middle::{
+    fhir::{self, SurfaceIdent},
+    rty,
+};
 use rustc_span::{Span, Symbol};
 
 #[derive(Diagnostic)]
-#[diag(fhir_analysis_sort_mismatch, code = "FLUX")]
+#[diag(fhir_analysis_sort_mismatch, code = E0999)]
 pub(super) struct SortMismatch {
     #[primary_span]
     #[label]
     span: Span,
-    expected: fhir::Sort,
-    found: fhir::Sort,
+    expected: rty::Sort,
+    found: rty::Sort,
 }
 
 impl SortMismatch {
-    pub(super) fn new(span: Span, expected: fhir::Sort, found: fhir::Sort) -> Self {
+    pub(super) fn new(span: Span, expected: rty::Sort, found: rty::Sort) -> Self {
         Self { span, expected, found }
     }
 }
 
 #[derive(Diagnostic)]
-#[diag(fhir_analysis_arg_count_mismatch, code = "FLUX")]
+#[diag(fhir_analysis_arg_count_mismatch, code = E0999)]
 pub(super) struct ArgCountMismatch {
     #[primary_span]
     #[label]
@@ -36,7 +40,7 @@ impl ArgCountMismatch {
 }
 
 #[derive(Diagnostic)]
-#[diag(fhir_analysis_early_bound_arg_count_mismatch, code = "FLUX")]
+#[diag(fhir_analysis_early_bound_arg_count_mismatch, code = E0999)]
 pub(super) struct EarlyBoundArgCountMismatch {
     #[primary_span]
     #[label]
@@ -52,21 +56,21 @@ impl EarlyBoundArgCountMismatch {
 }
 
 #[derive(Diagnostic)]
-#[diag(fhir_analysis_duplicated_ensures, code = "FLUX")]
+#[diag(fhir_analysis_duplicated_ensures, code = E0999)]
 pub(super) struct DuplicatedEnsures {
     #[primary_span]
     span: Span,
-    loc: Symbol,
+    loc: String,
 }
 
 impl DuplicatedEnsures {
-    pub(super) fn new(loc: &fhir::Ident) -> DuplicatedEnsures {
-        Self { span: loc.span(), loc: loc.sym() }
+    pub(super) fn new(loc: &fhir::PathExpr) -> DuplicatedEnsures {
+        Self { span: loc.span, loc: format!("{loc:?}") }
     }
 }
 
 #[derive(Diagnostic)]
-#[diag(fhir_analysis_unknown_qualifier, code = "FLUX")]
+#[diag(fhir_analysis_unknown_qualifier, code = E0999)]
 pub(super) struct UnknownQualifier {
     #[primary_span]
     span: Span,
@@ -79,80 +83,65 @@ impl UnknownQualifier {
 }
 
 #[derive(Diagnostic)]
-#[diag(fhir_analysis_missing_ensures, code = "FLUX")]
+#[diag(fhir_analysis_missing_ensures, code = E0999)]
 pub(super) struct MissingEnsures {
     #[primary_span]
     span: Span,
 }
 
 impl MissingEnsures {
-    pub(super) fn new(loc: &fhir::Ident) -> MissingEnsures {
-        Self { span: loc.span() }
+    pub(super) fn new(loc: &fhir::PathExpr) -> MissingEnsures {
+        Self { span: loc.span }
     }
 }
 
 #[derive(Diagnostic)]
-#[diag(fhir_analysis_expected_fun, code = "FLUX")]
+#[diag(fhir_analysis_expected_fun, code = E0999)]
 pub(super) struct ExpectedFun<'a> {
     #[primary_span]
     span: Span,
-    found: &'a fhir::Sort,
+    found: &'a rty::Sort,
 }
 
 impl<'a> ExpectedFun<'a> {
-    pub(super) fn new(span: Span, found: &'a fhir::Sort) -> Self {
+    pub(super) fn new(span: Span, found: &'a rty::Sort) -> Self {
         Self { span, found }
     }
 }
 
 #[derive(Diagnostic)]
-#[diag(fhir_analysis_invalid_param_in_func_pos, code = "FLUX")]
+#[diag(fhir_analysis_invalid_param_in_func_pos, code = E0999)]
 pub(super) struct InvalidParamPos<'a> {
     #[primary_span]
     #[label]
     span: Span,
-    sort: &'a fhir::Sort,
+    sort: &'a rty::Sort,
     is_pred: bool,
 }
 
 impl<'a> InvalidParamPos<'a> {
-    pub(super) fn new(span: Span, sort: &'a fhir::Sort) -> Self {
+    pub(super) fn new(span: Span, sort: &'a rty::Sort) -> Self {
         Self { span, sort, is_pred: sort.is_pred() }
     }
 }
 
 #[derive(Diagnostic)]
-#[diag(fhir_analysis_unexpected_fun, code = "FLUX")]
+#[diag(fhir_analysis_unexpected_fun, code = E0999)]
 pub(super) struct UnexpectedFun<'a> {
     #[primary_span]
     #[label]
     span: Span,
-    sort: &'a fhir::Sort,
+    sort: &'a rty::Sort,
 }
 
 impl<'a> UnexpectedFun<'a> {
-    pub(super) fn new(span: Span, sort: &'a fhir::Sort) -> Self {
+    pub(super) fn new(span: Span, sort: &'a rty::Sort) -> Self {
         Self { span, sort }
     }
 }
 
 #[derive(Diagnostic)]
-#[diag(fhir_analysis_expected_numeric, code = "FLUX")]
-pub(super) struct ExpectedNumeric<'a> {
-    #[primary_span]
-    #[label]
-    span: Span,
-    found: &'a fhir::Sort,
-}
-
-impl<'a> ExpectedNumeric<'a> {
-    pub(super) fn new(span: Span, found: &'a fhir::Sort) -> Self {
-        Self { span, found }
-    }
-}
-
-#[derive(Diagnostic)]
-#[diag(fhir_analysis_param_count_mismatch, code = "FLUX")]
+#[diag(fhir_analysis_param_count_mismatch, code = E0999)]
 pub(super) struct ParamCountMismatch {
     #[primary_span]
     #[label]
@@ -168,80 +157,52 @@ impl ParamCountMismatch {
 }
 
 #[derive(Diagnostic)]
-#[diag(fhir_analysis_field_not_found, code = "FLUX")]
+#[diag(fhir_analysis_field_not_found, code = E0999)]
 pub(super) struct FieldNotFound {
     #[primary_span]
     span: Span,
-    sort: fhir::Sort,
+    sort: rty::Sort,
     fld: SurfaceIdent,
 }
 
 impl FieldNotFound {
-    pub(super) fn new(sort: fhir::Sort, fld: SurfaceIdent) -> Self {
+    pub(super) fn new(sort: rty::Sort, fld: SurfaceIdent) -> Self {
         Self { span: fld.span, sort, fld }
     }
 }
 
 #[derive(Diagnostic)]
-#[diag(fhir_analysis_invalid_primitive_dot_access, code = "FLUX")]
+#[diag(fhir_analysis_invalid_primitive_dot_access, code = E0999)]
 pub(super) struct InvalidPrimitiveDotAccess<'a> {
     #[primary_span]
     span: Span,
-    sort: &'a fhir::Sort,
+    sort: &'a rty::Sort,
 }
 
 impl<'a> InvalidPrimitiveDotAccess<'a> {
-    pub(super) fn new(sort: &'a fhir::Sort, fld: SurfaceIdent) -> Self {
+    pub(super) fn new(sort: &'a rty::Sort, fld: SurfaceIdent) -> Self {
         Self { sort, span: fld.span }
     }
 }
 
 #[derive(Diagnostic)]
-#[diag(fhir_analysis_invalid_base_instance, code = "FLUX")]
-pub(super) struct InvalidBaseInstance<'a> {
-    #[primary_span]
-    span: Span,
-    ty: &'a fhir::Ty,
-}
-
-impl<'a> InvalidBaseInstance<'a> {
-    pub(super) fn new(ty: &'a fhir::Ty) -> Self {
-        Self { ty, span: ty.span }
-    }
-}
-
-#[derive(Diagnostic)]
-#[diag(fhir_analysis_no_equality, code = "FLUX")]
-pub(super) struct NoEquality<'a> {
-    #[primary_span]
-    span: Span,
-    sort: &'a fhir::Sort,
-}
-
-impl<'a> NoEquality<'a> {
-    pub(super) fn new(span: Span, sort: &'a fhir::Sort) -> Self {
-        Self { span, sort }
-    }
-}
-
-#[derive(Diagnostic)]
-#[diag(fhir_analysis_param_not_determined, code = "FLUX")]
+#[diag(fhir_analysis_param_not_determined, code = E0999)]
 #[help]
 pub(super) struct ParamNotDetermined {
     #[primary_span]
     #[label]
     span: Span,
-    sym: Symbol,
+    name: Symbol,
 }
 
 impl ParamNotDetermined {
-    pub(super) fn new(ident: fhir::Ident) -> Self {
-        Self { span: ident.span(), sym: ident.sym() }
+    pub(super) fn new(span: Span, name: Symbol) -> Self {
+        Self { span, name }
     }
 }
 
 #[derive(Diagnostic)]
-#[diag(fhir_analysis_sort_annotation_needed, code = "FLUX")]
+#[diag(fhir_analysis_sort_annotation_needed, code = E0999)]
 pub(super) struct SortAnnotationNeeded {
     #[primary_span]
     #[label]
@@ -250,12 +211,12 @@ pub(super) struct SortAnnotationNeeded {
 
 impl SortAnnotationNeeded {
     pub(super) fn new(param: &fhir::RefineParam) -> Self {
-        Self { span: param.ident.span() }
+        Self { span: param.span }
     }
 }
 
 #[derive(Diagnostic)]
-#[diag(fhir_analysis_cannot_infer_sort, code = "FLUX")]
+#[diag(fhir_analysis_cannot_infer_sort, code = E0999)]
 #[note]
 pub(super) struct CannotInferSort {
     #[primary_span]
@@ -264,7 +225,20 @@ pub(super) struct CannotInferSort {
 }
 
 impl CannotInferSort {
-    pub(super) fn new(ident: fhir::Ident) -> Self {
-        Self { span: ident.span() }
+    pub(super) fn new(span: Span) -> Self {
+        Self { span }
+    }
+}
+
+#[derive(Diagnostic)]
+#[diag(fhir_analysis_refined_unrefinable_type, code = E0999)]
+pub(super) struct RefinedUnrefinableType {
+    #[primary_span]
+    span: Span,
+}
+
+impl RefinedUnrefinableType {
+    pub(super) fn new(span: Span) -> Self {
+        Self { span }
     }
 }

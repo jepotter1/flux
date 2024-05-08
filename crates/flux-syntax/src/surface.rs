@@ -7,7 +7,7 @@ pub use rustc_ast::{
     Mutability,
 };
 pub use rustc_span::symbol::Ident;
-use rustc_span::{def_id::DefId, symbol::kw, Span};
+use rustc_span::{def_id::DefId, Span};
 
 use crate::surface::visit::Visitor;
 
@@ -30,7 +30,7 @@ pub struct SortDecl {
 #[derive(Debug)]
 pub enum Item {
     Qualifier(Qualifier),
-    FuncDef(FuncDef),
+    FuncDef(SpecFunc),
     SortDecl(SortDecl),
 }
 
@@ -46,7 +46,7 @@ pub struct Qualifier {
 /// A global function definition. It can be either an uninterpreted function or a *syntactic abstraction*,
 /// i.e., a function with a body.
 #[derive(Debug)]
-pub struct FuncDef {
+pub struct SpecFunc {
     pub name: Ident,
     pub sort_vars: Vec<Ident>,
     pub args: Vec<RefineParam>,
@@ -58,6 +58,7 @@ pub struct FuncDef {
 #[derive(Debug)]
 pub struct Generics {
     pub params: Vec<GenericParam>,
+    pub predicates: Vec<WhereBoundPredicate>,
     pub span: Span,
 }
 
@@ -65,12 +66,12 @@ pub struct Generics {
 pub struct GenericParam {
     pub name: Ident,
     pub kind: GenericParamKind,
+    pub node_id: NodeId,
 }
 
 #[derive(Debug)]
 pub enum GenericParamKind {
     Type,
-    Spl,
     Base,
     Refine { sort: Sort },
 }
@@ -78,7 +79,7 @@ pub enum GenericParamKind {
 #[derive(Debug)]
 pub struct TyAlias {
     pub ident: Ident,
-    pub generics: Vec<Ty>,
+    pub generics: Generics,
     pub refined_by: RefinedBy,
     pub ty: Ty,
     pub node_id: NodeId,
@@ -93,6 +94,8 @@ pub struct StructDef {
     pub opaque: bool,
     pub invariants: Vec<Expr>,
     pub node_id: NodeId,
+    /// Whether the struct is an extern spec for some [DefId]
+    pub extern_id: Option<DefId>,
 }
 
 impl StructDef {
@@ -104,11 +107,12 @@ impl StructDef {
 
 #[derive(Debug)]
 pub struct EnumDef {
+    pub generics: Option<Generics>,
     pub refined_by: Option<RefinedBy>,
     pub variants: Vec<Option<VariantDef>>,
     pub invariants: Vec<Expr>,
     pub node_id: NodeId,
-    /// whether the enum is an extern spec for some [DefId]
+    /// Whether the enum is an extern spec for some [DefId]
     pub extern_id: Option<DefId>,
 }
 
@@ -137,8 +141,7 @@ pub struct VariantRet {
 
 #[derive(Debug, Default)]
 pub struct RefinedBy {
-    pub early_bound_params: Vec<RefineParam>,
-    pub index_params: Vec<RefineParam>,
+    pub fields: Vec<RefineParam>,
     pub span: Span,
 }
 
@@ -151,6 +154,8 @@ pub struct QualNames {
 pub struct RefineParam {
     pub name: Ident,
     pub sort: Sort,
+    pub span: Span,
+    pub node_id: NodeId,
 }
 
 #[derive(Debug)]
@@ -159,21 +164,27 @@ pub enum Sort {
     Base(BaseSort),
     /// A _function_ sort of the form `(bi,...) -> bo` where `bi..` and `bo`
     /// are all base sorts.
-    Func {
-        inputs: Vec<BaseSort>,
-        output: BaseSort,
-    },
+    Func { inputs: Vec<BaseSort>, output: BaseSort },
+    /// A sort that needs to be inferred.
     Infer,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum BaseSort {
-    /// a _base_ sort, e.g. `int` or `bool`
-    Ident(Ident),
-    /// a bitvector sort, e.g., BitVec(32)
+    /// a bitvector sort, e.g., bitvec<32>
     BitVec(usize),
-    /// a sort-constructor application, e.g., `Set<int>`
-    App(Ident, Vec<BaseSort>),
+    Path(SortPath),
+}
+
+/// A [`Path`] but for sorts. Currently, we only support paths with one segment, so one can hardly
+/// call this a path, but we may change this later if we improve the resolver.
+#[derive(Debug)]
+pub struct SortPath {
+    /// The identifier of the single segment in the path, i.e., `Map` in `Map<int, bool>`.
+    pub segment: Ident,
+    /// The sort arguments, i.e., the list `[int, bool]` in `Map<int, bool>`.
+    pub args: Vec<BaseSort>,
+    pub node_id: NodeId,
 }
 
 #[derive(Debug)]
@@ -182,28 +193,71 @@ pub struct ConstSig {
 }
 
 #[derive(Debug)]
+pub struct Impl {
+    pub generics: Option<Generics>,
+    pub assoc_refinements: Vec<ImplAssocReft>,
+    /// Whether the enum is an extern spec for some [DefId]
+    pub extern_id: Option<DefId>,
+}
+
+#[derive(Debug)]
+pub struct ImplAssocReft {
+    pub name: Ident,
+    pub params: Vec<RefineParam>,
+    pub output: BaseSort,
+    pub body: Expr,
+    pub span: Span,
+}
+
+pub struct Trait {
+    pub generics: Option<Generics>,
+    pub assoc_refinements: Vec<TraitAssocReft>,
+}
+
+#[derive(Debug)]
+pub struct TraitAssocReft {
+    pub name: Ident,
+    pub params: Vec<RefineParam>,
+    pub output: BaseSort,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct FnSpec {
+    pub fn_sig: Option<FnSig>,
+    pub trusted: bool,
+    pub qual_names: Option<QualNames>,
+    /// Whether this function is an extern spec for some [DefId]
+    pub extern_id: Option<DefId>,
+}
+
+#[derive(Debug)]
 pub struct FnSig {
     pub asyncness: Async,
-    pub generics: Option<Generics>,
+    pub generics: Generics,
     /// example: `requires n > 0`
     pub requires: Option<Expr>,
     /// example: `i32<@n>`
     pub args: Vec<Arg>,
-    /// example `i32{v:v >= 0}`
-    pub returns: FnRetTy,
-    /// example: `*x: i32{v. v = n+1}` or just `x > 10`
-    pub ensures: Vec<Constraint>,
-    /// example: `where I: Iterator<Item = i32{v:0<=v}>`
-    pub predicates: Option<Vec<WhereBoundPredicate>>,
+    pub output: FnOutput,
     /// source span
     pub span: Span,
     pub node_id: NodeId,
 }
 
 #[derive(Debug)]
+pub struct FnOutput {
+    /// example `i32{v:v >= 0}`
+    pub returns: FnRetTy,
+    /// example: `*x: i32{v. v = n+1}` or just `x > 10`
+    pub ensures: Vec<Constraint>,
+    pub node_id: NodeId,
+}
+
+#[derive(Debug)]
 pub enum Constraint {
     /// A type constraint on a location
-    Type(Ident, Ty),
+    Type(Ident, Ty, NodeId),
     /// A predicate that needs to hold
     Pred(Expr),
 }
@@ -237,12 +291,12 @@ pub struct TraitRef {
 #[derive(Debug)]
 pub enum Arg {
     /// example `a: i32{a > 0}`
-    Constr(Ident, Path, Expr),
+    Constr(Ident, Path, Expr, NodeId),
     /// example `v: &strg i32`
-    StrgRef(Ident, Ty),
+    StrgRef(Ident, Ty, NodeId),
     /// A type with an optional binder, e.g, `i32`, `x: i32` or `x: i32{v: v > 0}`.
     /// The binder has a different meaning depending on the type.
-    Ty(Option<Ident>, Ty),
+    Ty(Option<Ident>, Ty, NodeId),
 }
 
 #[derive(Debug)]
@@ -250,6 +304,14 @@ pub struct Ty {
     pub kind: TyKind,
     pub node_id: NodeId,
     pub span: Span,
+}
+
+/// `<qself as path>::name`
+#[derive(Debug)]
+pub struct AliasReft {
+    pub qself: Box<Ty>,
+    pub path: Path,
+    pub name: Ident,
 }
 
 #[derive(Debug)]
@@ -280,22 +342,10 @@ pub enum TyKind {
     Array(Box<Ty>, ArrayLen),
     /// The `NodeId` is used to resolve the type to a corresponding `OpaqueTy`
     ImplTrait(NodeId, GenericBounds),
+    Hole,
 }
 
 impl Ty {
-    pub fn as_bty(&self) -> Option<&BaseTy> {
-        match &self.kind {
-            TyKind::Base(bty) | TyKind::Indexed { bty, .. } | TyKind::Exists { bty, .. } => {
-                Some(bty)
-            }
-            TyKind::GeneralExists { ty, .. } | TyKind::Constr(_, ty) => ty.as_bty(),
-            TyKind::Ref(_, _)
-            | TyKind::Tuple(_)
-            | TyKind::Array(_, _)
-            | TyKind::ImplTrait(_, _) => None,
-        }
-    }
-
     pub fn is_refined(&self) -> bool {
         struct IsRefinedVisitor {
             is_refined: bool,
@@ -303,7 +353,7 @@ impl Ty {
         let mut vis = IsRefinedVisitor { is_refined: false };
         impl visit::Visitor for IsRefinedVisitor {
             fn visit_ty(&mut self, ty: &Ty) {
-                if !matches!(ty.kind, TyKind::Base(_)) {
+                if !matches!(ty.kind, TyKind::Base(_) | TyKind::Hole) {
                     self.is_refined = true;
                 }
                 visit::walk_ty(self, ty);
@@ -321,7 +371,7 @@ pub struct BaseTy {
 
 #[derive(Debug)]
 pub enum BaseTyKind {
-    Path(Path),
+    Path(Option<Box<Ty>>, Path),
     Slice(Box<Ty>),
 }
 
@@ -340,9 +390,9 @@ pub struct Indices {
 #[derive(Debug)]
 pub enum RefineArg {
     /// `@n` or `#n`, the span corresponds to the span of the identifier plus the binder token (`@` or `#`)
-    Bind(Ident, BindKind, Span),
+    Bind(Ident, BindKind, Span, NodeId),
     Expr(Expr),
-    Abs(Vec<RefineParam>, Expr, NodeId, Span),
+    Abs(Vec<RefineParam>, Expr, Span, NodeId),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -353,39 +403,61 @@ pub enum BindKind {
 
 #[derive(Debug)]
 pub struct Path {
-    pub segments: Vec<Ident>,
-    pub generics: Vec<GenericArg>,
+    pub segments: Vec<PathSegment>,
     pub refine: Vec<RefineArg>,
     pub span: Span,
+}
+
+impl Path {
+    pub fn last(&self) -> &PathSegment {
+        self.segments
+            .last()
+            .expect("path must have at least one segment")
+    }
+}
+
+#[derive(Debug)]
+pub struct PathSegment {
+    pub ident: Ident,
+    pub args: Vec<GenericArg>,
     pub node_id: NodeId,
 }
 
 #[derive(Debug)]
-pub enum GenericArg {
+pub struct GenericArg {
+    pub kind: GenericArgKind,
+    pub node_id: NodeId,
+}
+
+#[derive(Debug)]
+pub enum GenericArgKind {
     Type(Ty),
     Constraint(Ident, Ty),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Expr {
     pub kind: ExprKind,
+    pub node_id: NodeId,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ExprKind {
-    QPath(QPathExpr),
-    Dot(QPathExpr, Ident),
+    Path(PathExpr),
+    Dot(PathExpr, Ident),
     Literal(Lit),
     BinaryOp(BinOp, Box<[Expr; 2]>),
     UnaryOp(UnOp, Box<Expr>),
     App(Ident, Vec<Expr>),
+    Alias(AliasReft, Vec<Expr>),
     IfThenElse(Box<[Expr; 3]>),
 }
 
 #[derive(Debug, Clone)]
-pub struct QPathExpr {
+pub struct PathExpr {
     pub segments: Vec<Ident>,
+    pub node_id: NodeId,
     pub span: Span,
 }
 
@@ -396,16 +468,16 @@ pub enum BinOp {
     Or,
     And,
     Eq,
-    Lt,
-    Le,
+    Ne,
     Gt,
     Ge,
-    Ne,
+    Lt,
+    Le,
     Add,
     Sub,
-    Mod,
     Mul,
     Div,
+    Mod,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -414,28 +486,12 @@ pub enum UnOp {
     Neg,
 }
 
-impl Path {
-    pub fn is_hole(&self) -> bool {
-        if let [segment] = &self.segments[..] {
-            segment.name == kw::Underscore && self.generics.is_empty() && self.refine.is_empty()
-        } else {
-            false
-        }
-    }
-}
-
 impl BindKind {
     pub fn token_str(&self) -> &'static str {
         match self {
             BindKind::At => "@",
             BindKind::Pound => "#",
         }
-    }
-}
-
-impl RefinedBy {
-    pub fn all_params(&self) -> impl Iterator<Item = &RefineParam> {
-        self.early_bound_params.iter().chain(&self.index_params)
     }
 }
 

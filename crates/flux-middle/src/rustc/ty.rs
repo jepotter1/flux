@@ -13,7 +13,7 @@ use rustc_middle::ty::{AdtFlags, ParamConst, TyCtxt};
 pub use rustc_middle::{
     mir::Mutability,
     ty::{
-        BoundRegionKind, BoundVar, DebruijnIndex, EarlyBoundRegion, FloatTy, IntTy,
+        BoundRegionKind, BoundVar, DebruijnIndex, EarlyParamRegion, FloatTy, IntTy,
         OutlivesPredicate, ParamTy, RegionVid, ScalarInt, UintTy,
     },
 };
@@ -26,6 +26,7 @@ use crate::{
     pretty::def_id_to_string,
 };
 
+#[derive(Debug, Clone)]
 pub struct Generics<'tcx> {
     pub params: List<GenericParamDef>,
     pub orig: &'tcx rustc_middle::ty::Generics,
@@ -42,7 +43,7 @@ pub enum BoundVariableKind {
     Region(BoundRegionKind),
 }
 
-#[derive(Hash, Eq, PartialEq)]
+#[derive(Debug, Hash, Eq, PartialEq)]
 pub struct GenericParamDef {
     pub def_id: DefId,
     pub index: u32,
@@ -50,14 +51,20 @@ pub struct GenericParamDef {
     pub kind: GenericParamDefKind,
 }
 
-#[derive(Hash, Eq, PartialEq)]
+impl GenericParamDef {
+    pub fn is_host_effect(&self) -> bool {
+        matches!(self.kind, GenericParamDefKind::Const { is_host_effect: true, .. })
+    }
+}
+
+#[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
 pub enum GenericParamDefKind {
     Type { has_default: bool },
     Lifetime,
-    Const { has_default: bool },
+    Const { has_default: bool, is_host_effect: bool },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct GenericPredicates {
     pub parent: Option<DefId>,
     pub predicates: List<Clause>,
@@ -73,6 +80,7 @@ pub enum ClauseKind {
     Trait(TraitPredicate),
     Projection(ProjectionPredicate),
     TypeOutlives(TypeOutlivesPredicate),
+    ConstArgHasType(Const, Ty),
 }
 
 pub type TypeOutlivesPredicate = OutlivesPredicate<Ty, Region>;
@@ -106,14 +114,33 @@ pub struct Ty(Interned<TyS>);
 #[derive(Debug, Eq, PartialEq, Hash, Clone, TyEncodable, TyDecodable)]
 pub struct AdtDef(Interned<AdtDefData>);
 
-#[derive(Debug, Eq, PartialEq, Hash, TyEncodable, TyDecodable)]
+#[derive(Debug, TyEncodable, TyDecodable)]
 pub struct AdtDefData {
     pub did: DefId,
     variants: IndexVec<VariantIdx, VariantDef>,
+    discrs: IndexVec<VariantIdx, u128>,
     flags: AdtFlags,
 }
 
-#[derive(Debug, Eq, PartialEq, Hash, TyEncodable, TyDecodable)]
+/// There should be only one AdtDef for each `did`, therefore
+/// it is fine to implement `Hash` only based on `did`.
+impl std::hash::Hash for AdtDefData {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.did.hash(state);
+    }
+}
+
+/// There should be only one AdtDef for each `did`, therefore
+/// it is fine to implement `PartialEq` only based on `did`.
+impl PartialEq for AdtDefData {
+    fn eq(&self, other: &Self) -> bool {
+        self.did == other.did
+    }
+}
+
+impl Eq for AdtDefData {}
+
+#[derive(Debug, TyEncodable, TyDecodable)]
 pub struct VariantDef {
     pub def_id: DefId,
     pub name: Symbol,
@@ -201,11 +228,11 @@ impl GenericArgs {
         ClosureArgs { args: self.clone() }
     }
 
-    pub fn as_generator(&self) -> GeneratorArgs {
-        GeneratorArgs { args: self.clone() }
+    pub fn as_coroutine(&self) -> CoroutineArgs {
+        CoroutineArgs { args: self.clone() }
     }
 }
-pub struct GeneratorArgs {
+pub struct CoroutineArgs {
     pub args: GenericArgs,
 }
 
@@ -222,22 +249,38 @@ pub struct ClosureArgsParts<'a, T> {
 }
 
 #[derive(Debug)]
-pub struct GeneratorArgsParts<'a, T> {
-    pub parent_args: &'a [T],
-    pub resume_ty: &'a T,
-    pub yield_ty: &'a T,
-    pub return_ty: &'a T,
-    pub witness: &'a T,
-    pub tupled_upvars_ty: &'a T,
+pub struct CoroutineArgsParts<'a> {
+    pub parent_args: &'a [GenericArg],
+    pub resume_ty: &'a Ty,
+    pub yield_ty: &'a Ty,
+    pub return_ty: &'a Ty,
+    pub witness: &'a Ty,
+    pub tupled_upvars_ty: &'a Ty,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, TyEncodable, TyDecodable)]
 pub enum Region {
     ReLateBound(DebruijnIndex, BoundRegion),
-    ReEarlyBound(EarlyBoundRegion),
+    ReEarlyBound(EarlyParamRegion),
     ReStatic,
     ReVar(RegionVid),
     ReFree(FreeRegion),
+}
+
+impl Region {
+    pub fn to_rustc(self, tcx: TyCtxt) -> rustc_middle::ty::Region {
+        match self {
+            Region::ReLateBound(debruijn, bound_region) => {
+                rustc_middle::ty::Region::new_bound(tcx, debruijn, bound_region.to_rustc())
+            }
+            Region::ReEarlyBound(epr) => rustc_middle::ty::Region::new_early_param(tcx, epr),
+            Region::ReStatic => tcx.lifetimes.re_static,
+            Region::ReVar(rvid) => rustc_middle::ty::Region::new_var(tcx, rvid),
+            Region::ReFree(FreeRegion { scope, bound_region }) => {
+                rustc_middle::ty::Region::new_late_param(tcx, scope, bound_region)
+            }
+        }
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, TyEncodable, TyDecodable)]
@@ -250,6 +293,12 @@ pub struct FreeRegion {
 pub struct BoundRegion {
     pub var: BoundVar,
     pub kind: BoundRegionKind,
+}
+
+impl BoundRegion {
+    fn to_rustc(self) -> rustc_middle::ty::BoundRegion {
+        rustc_middle::ty::BoundRegion { var: self.var, kind: self.kind }
+    }
 }
 
 impl Generics<'_> {
@@ -338,25 +387,29 @@ impl GenericArg {
     }
 }
 
-impl GeneratorArgs {
+impl CoroutineArgs {
     pub fn tupled_upvars_ty(&self) -> &Ty {
-        self.split().tupled_upvars_ty.expect_type()
+        self.split().tupled_upvars_ty
     }
 
     pub fn upvar_tys(&self) -> impl Iterator<Item = &Ty> {
         self.tupled_upvars_ty().tuple_fields().iter()
     }
 
-    fn split(&self) -> GeneratorArgsParts<GenericArg> {
+    pub fn resume_ty(&self) -> &Ty {
+        self.split().resume_ty
+    }
+
+    fn split(&self) -> CoroutineArgsParts {
         match &self.args[..] {
             [ref parent_args @ .., resume_ty, yield_ty, return_ty, witness, tupled_upvars_ty] => {
-                GeneratorArgsParts {
+                CoroutineArgsParts {
                     parent_args,
-                    resume_ty,
-                    yield_ty,
-                    return_ty,
-                    witness,
-                    tupled_upvars_ty,
+                    resume_ty: resume_ty.expect_type(),
+                    yield_ty: yield_ty.expect_type(),
+                    return_ty: return_ty.expect_type(),
+                    witness: witness.expect_type(),
+                    tupled_upvars_ty: tupled_upvars_ty.expect_type(),
                 }
             }
             _ => bug!("generator args missing synthetics"),
@@ -425,6 +478,13 @@ impl AdtDef {
         &self.0.variants
     }
 
+    pub fn discriminants(&self) -> impl Iterator<Item = (VariantIdx, u128)> + '_ {
+        self.0
+            .discrs
+            .iter_enumerated()
+            .map(|(idx, discr)| (idx, *discr))
+    }
+
     pub fn non_enum_variant(&self) -> &VariantDef {
         assert!(self.is_struct() || self.is_union());
         self.variant(FIRST_VARIANT)
@@ -432,12 +492,21 @@ impl AdtDef {
 }
 
 impl AdtDefData {
-    pub(crate) fn new(
-        did: DefId,
+    pub(crate) fn new<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        adt_def: rustc_middle::ty::AdtDef<'tcx>,
         variants: IndexVec<VariantIdx, VariantDef>,
-        flags: AdtFlags,
     ) -> Self {
-        Self { did, variants, flags }
+        let discrs: IndexVec<VariantIdx, u128> = if adt_def.is_enum() {
+            adt_def
+                .discriminants(tcx)
+                .map(|(_, discr)| discr.val)
+                .collect()
+        } else {
+            IndexVec::from_raw(vec![0])
+        };
+        assert_eq!(discrs.len(), variants.len());
+        Self { did: adt_def.did(), variants, flags: adt_def.flags(), discrs }
     }
 }
 
@@ -537,10 +606,6 @@ impl Ty {
 
     pub fn mk_char() -> Ty {
         TyKind::Char.intern()
-    }
-
-    pub fn mk_usize() -> Ty {
-        TyKind::Uint(UintTy::Usize).intern()
     }
 
     pub fn deref(&self) -> Ty {

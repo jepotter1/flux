@@ -18,6 +18,7 @@ pub struct Items(Vec<Item>);
 
 #[derive(Debug)]
 pub enum Item {
+    Const(syn::ItemConst),
     Struct(ItemStruct),
     Enum(ItemEnum),
     Use(syn::ItemUse),
@@ -144,6 +145,7 @@ pub struct ItemStruct {
     pub struct_token: Token![struct],
     pub ident: Ident,
     pub generics: Generics,
+    #[cfg_attr(not(flux_sysroot), allow(dead_code))]
     pub refined_by: Option<RefinedBy>,
     pub fields: Fields,
     pub semi_token: Option<Token![;]>,
@@ -156,6 +158,7 @@ pub struct ItemEnum {
     pub enum_token: Token![enum],
     pub ident: Ident,
     pub generics: Generics,
+    #[cfg_attr(not(flux_sysroot), allow(dead_code))]
     pub refined_by: Option<RefinedBy>,
     pub brace_token: token::Brace,
     pub variants: Punctuated<Variant, Token![,]>,
@@ -174,6 +177,7 @@ pub struct Variant {
     /// Explicit discriminant: `Variant = 1`
     pub discriminant: Option<(Token![=], syn::Expr)>,
 
+    #[cfg_attr(not(flux_sysroot), allow(dead_code))]
     pub ret: Option<VariantRet>,
 }
 
@@ -187,6 +191,7 @@ impl Variant {
     }
 }
 
+#[cfg(flux_sysroot)]
 impl ToTokens for ToTokensFlux<&Variant> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let variant = &self.0;
@@ -205,6 +210,7 @@ impl ToTokens for ToTokensFlux<&Variant> {
     }
 }
 
+#[cfg_attr(not(flux_sysroot), allow(dead_code))]
 #[derive(Debug)]
 pub struct VariantRet {
     pub arrow_token: Option<Token![->]>,
@@ -215,8 +221,8 @@ pub struct VariantRet {
 
 #[derive(Debug)]
 pub struct RefinedBy {
-    pub refined_by: Option<(kw::refined, kw::by)>,
-    pub bracket_token: token::Bracket,
+    pub _refined_by: Option<(kw::refined, kw::by)>,
+    pub _bracket_token: token::Bracket,
     pub params: Punctuated<RefinedByParam, Token![,]>,
 }
 
@@ -232,8 +238,8 @@ impl RefinedBy {
 #[derive(Debug)]
 pub struct RefinedByParam {
     pub ident: Ident,
-    pub colon_token: Option<Token![:]>,
-    pub sort: Ident,
+    pub colon_token: Token![:],
+    pub sort: Sort,
 }
 
 #[derive(Debug)]
@@ -291,7 +297,7 @@ pub struct Field {
 
     pub vis: Visibility,
 
-    pub mutability: syn::FieldMutability,
+    pub _mutability: syn::FieldMutability,
 
     /// Name of the field, if any.
     ///
@@ -308,7 +314,7 @@ impl Field {
         Ok(Field {
             attrs: input.call(Attribute::parse_outer)?,
             vis: input.parse()?,
-            mutability: syn::FieldMutability::None,
+            _mutability: syn::FieldMutability::None,
             ident: None,
             colon_token: None,
             ty: input.parse()?,
@@ -325,7 +331,7 @@ impl Field {
         Ok(Field {
             attrs,
             vis,
-            mutability: syn::FieldMutability::None,
+            _mutability: syn::FieldMutability::None,
             ident: Some(ident),
             colon_token: Some(colon_token),
             ty,
@@ -419,10 +425,9 @@ pub struct Requires {
 }
 
 #[derive(Debug)]
-pub struct Constraint {
-    pub ident: Ident,
-    pub colon_token: Token![:],
-    pub ty: Box<Type>,
+pub enum Constraint {
+    Type { ident: Ident, colon_token: Token![:], ty: Box<Type> },
+    Expr(Expr),
 }
 
 #[derive(Debug)]
@@ -467,6 +472,45 @@ pub struct StrgRef {
 }
 
 #[derive(Debug)]
+pub enum Sort {
+    BaseSort(BaseSort),
+    Func { input: FuncSortInput, arrow: Token![->], output: BaseSort },
+}
+
+#[derive(Debug)]
+pub enum FuncSortInput {
+    Parenthesized { paren_token: token::Paren, inputs: Punctuated<BaseSort, Token![,]> },
+    Single(BaseSort),
+}
+
+#[derive(Debug)]
+pub enum BaseSort {
+    BitVec(BitVecSort),
+    App(Ident, SortArguments),
+}
+
+#[derive(Debug)]
+pub struct BitVecSort {
+    pub bitvec_token: kw::bitvec,
+    pub lt_token: Token![<],
+    pub lit: syn::LitInt,
+    pub gt_token: Token![>],
+}
+
+#[derive(Debug)]
+pub enum SortArguments {
+    None,
+    AngleBracketed(AngleBracketedSortArgs),
+}
+
+#[derive(Debug)]
+pub struct AngleBracketedSortArgs {
+    pub lt_token: Token![<],
+    pub args: Punctuated<BaseSort, Token![,]>,
+    pub gt_token: Token![>],
+}
+
+#[derive(Debug)]
 pub enum Type {
     Base(BaseType),
     Indexed(TypeIndexed),
@@ -476,6 +520,7 @@ pub enum Type {
     Constraint(TypeConstraint),
     Array(TypeArray),
     Tuple(TypeTuple),
+    Ptr(syn::TypePtr),
 }
 
 #[derive(Debug)]
@@ -531,6 +576,7 @@ pub struct ExistsParam {
 #[derive(Debug)]
 pub struct TypeReference {
     pub and_token: Token![&],
+    pub lifetime: Option<syn::Lifetime>,
     pub mutability: Option<Mut>,
     pub elem: Box<Type>,
 }
@@ -550,9 +596,6 @@ pub struct TypeArray {
     pub semi_token: Token![;],
     pub len: TokenStream,
 }
-
-#[derive(Debug)]
-pub struct TypeHole {}
 
 #[derive(Debug)]
 pub enum BaseType {
@@ -620,7 +663,7 @@ impl Parse for Items {
     }
 }
 
-const FLUX_ATTRS: &[&str] = &["opaque", "invariant", "trusted"];
+const FLUX_ATTRS: &[&str] = &["opaque", "invariant", "trusted", "generics", "assoc"];
 
 impl Parse for Item {
     fn parse(input: ParseStream) -> Result<Self> {
@@ -645,6 +688,8 @@ impl Parse for Item {
             Item::Type(input.parse()?)
         } else if lookahead.peek(Token![trait]) {
             Item::Trait(input.parse()?)
+        } else if lookahead.peek(Token![const]) {
+            Item::Const(input.parse()?)
         } else {
             return Err(lookahead.error());
         };
@@ -1047,8 +1092,8 @@ impl Parse for RefinedBy {
             if input.peek(kw::refined) { Some((input.parse()?, input.parse()?)) } else { None };
         let content;
         Ok(RefinedBy {
-            refined_by,
-            bracket_token: bracketed!(content in input),
+            _refined_by: refined_by,
+            _bracket_token: bracketed!(content in input),
             params: Punctuated::parse_terminated(&content)?,
         })
     }
@@ -1060,6 +1105,61 @@ impl Parse for RefinedByParam {
             ident: input.parse()?,
             colon_token: input.parse()?,
             sort: input.parse()?,
+        })
+    }
+}
+
+impl Parse for Sort {
+    fn parse(input: ParseStream) -> Result<Self> {
+        if input.peek(token::Paren) {
+            let content;
+            let input_sort = FuncSortInput::Parenthesized {
+                paren_token: parenthesized!(content in input),
+                inputs: content.parse_terminated(BaseSort::parse, Token![,])?,
+            };
+            Ok(Sort::Func { input: input_sort, arrow: input.parse()?, output: input.parse()? })
+        } else {
+            let sort: BaseSort = input.parse()?;
+            if input.peek(Token![->]) {
+                Ok(Sort::Func {
+                    input: FuncSortInput::Single(sort),
+                    arrow: input.parse()?,
+                    output: input.parse()?,
+                })
+            } else {
+                Ok(Sort::BaseSort(sort))
+            }
+        }
+    }
+}
+
+impl Parse for BaseSort {
+    fn parse(input: ParseStream) -> Result<Self> {
+        if input.peek(kw::bitvec) {
+            Ok(BaseSort::BitVec(BitVecSort {
+                bitvec_token: input.parse()?,
+                lt_token: input.parse()?,
+                lit: input.parse()?,
+                gt_token: input.parse()?,
+            }))
+        } else {
+            let ident = input.parse()?;
+            let arguments = if input.peek(Token![<]) && !input.peek(Token![<=]) {
+                SortArguments::AngleBracketed(input.parse()?)
+            } else {
+                SortArguments::None
+            };
+            Ok(BaseSort::App(ident, arguments))
+        }
+    }
+}
+
+impl Parse for AngleBracketedSortArgs {
+    fn parse(input: ParseStream) -> Result<Self> {
+        Ok(AngleBracketedSortArgs {
+            lt_token: input.parse()?,
+            args: parse_until(input, BaseSort::parse, Token![,], Token![>])?,
+            gt_token: input.parse()?,
         })
     }
 }
@@ -1259,7 +1359,6 @@ impl Parse for ItemImpl {
             trait_ = None;
             self_ty = first_ty;
         }
-
         Ok(ItemImpl {
             attrs,
             impl_token,
@@ -1335,24 +1434,21 @@ impl Parse for Signature {
 }
 
 fn parse_requires(input: ParseStream) -> Result<Option<Requires>> {
-    if input.peek(kw::requires) {
-        let requires_token = input.parse()?;
-        let mut constraint = TokenStream::new();
-        loop {
-            let tt: TokenTree = input.parse()?;
-            constraint.append(tt);
-            if input.is_empty()
-                || input.peek(kw::ensures)
-                || input.peek(token::Brace)
-                || input.peek(Token![,])
-            {
-                break;
-            }
-        }
-        Ok(Some(Requires { requires_token, constraint }))
-    } else {
-        Ok(None)
+    if !input.peek(kw::requires) {
+        return Ok(None);
     }
+
+    let requires_token = input.parse()?;
+    let mut constraint = TokenStream::new();
+    while !(input.is_empty()
+        || input.peek(kw::ensures)
+        || input.peek(token::Brace)
+        || input.peek(Token![,]))
+    {
+        let tt: TokenTree = input.parse()?;
+        constraint.append(tt);
+    }
+    Ok(Some(Requires { requires_token, constraint }))
 }
 
 fn parse_ensures(input: ParseStream) -> Result<Option<Ensures>> {
@@ -1368,11 +1464,25 @@ fn parse_ensures(input: ParseStream) -> Result<Option<Ensures>> {
 
 impl Parse for Constraint {
     fn parse(input: ParseStream) -> Result<Self> {
-        Ok(Constraint {
-            ident: parse_ident_or_self(input)?,
-            colon_token: input.parse()?,
-            ty: input.parse()?,
-        })
+        let mut expr = TokenStream::new();
+
+        if input.peek(Ident) || input.peek(Token![self]) {
+            let ident = parse_ident_or_self(input)?;
+            if input.peek(Token![:]) {
+                return Ok(Constraint::Type {
+                    ident,
+                    colon_token: input.parse()?,
+                    ty: input.parse()?,
+                });
+            }
+            expr.append(ident);
+        }
+
+        while !(input.is_empty() || input.peek(Token![,]) || input.peek(token::Brace)) {
+            let tt: TokenTree = input.parse()?;
+            expr.append(tt);
+        }
+        Ok(Constraint::Expr(expr))
     }
 }
 
@@ -1494,7 +1604,9 @@ impl Parse for Type {
                 parse_rty(input, BaseType::Slice(TypeSlice { bracket_token, ty }))?
             }
         } else if input.peek(token::Paren) {
-            input.parse().map(Type::Tuple)?
+            Type::Tuple(input.parse()?)
+        } else if input.peek(Token![*]) {
+            Type::Ptr(input.parse()?)
         } else {
             parse_rty(input, input.parse()?)?
         };
@@ -1545,6 +1657,7 @@ impl Parse for TypeReference {
     fn parse(input: ParseStream) -> Result<Self> {
         Ok(TypeReference {
             and_token: input.parse()?,
+            lifetime: input.parse()?,
             mutability: input.parse()?,
             elem: input.parse()?,
         })
@@ -1664,6 +1777,7 @@ mod kw {
     syn::custom_keyword!(refined);
     syn::custom_keyword!(by);
     syn::custom_keyword!(base);
+    syn::custom_keyword!(bitvec);
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -1682,7 +1796,8 @@ impl Item {
             | Item::Struct(ItemStruct { attrs, .. })
             | Item::Use(syn::ItemUse { attrs, .. })
             | Item::Trait(syn::ItemTrait { attrs, .. })
-            | Item::Type(ItemType { attrs, .. }) => mem::replace(attrs, new),
+            | Item::Type(ItemType { attrs, .. })
+            | Item::Const(syn::ItemConst { attrs, .. }) => mem::replace(attrs, new),
         }
     }
 }
@@ -1704,6 +1819,7 @@ impl ToTokens for Item {
             Item::Type(item_type) => item_type.to_tokens(tokens),
             Item::Mod(item_mod) => item_mod.to_tokens(tokens),
             Item::Trait(item_trait) => item_trait.to_tokens(tokens),
+            Item::Const(item_const) => item_const.to_tokens(tokens),
         }
     }
 }
@@ -1792,6 +1908,70 @@ impl ToTokens for RefinedByParam {
     }
 }
 
+impl ToTokens for Sort {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        match self {
+            Sort::BaseSort(bsort) => bsort.to_tokens(tokens),
+            Sort::Func { input, arrow, output } => {
+                input.to_tokens(tokens);
+                arrow.to_tokens(tokens);
+                output.to_tokens(tokens);
+            }
+        }
+    }
+}
+
+impl ToTokens for FuncSortInput {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        match self {
+            FuncSortInput::Parenthesized { paren_token, inputs } => {
+                paren_token.surround(tokens, |tokens| {
+                    inputs.to_tokens(tokens);
+                });
+            }
+            FuncSortInput::Single(bsort) => bsort.to_tokens(tokens),
+        }
+    }
+}
+
+impl ToTokens for BaseSort {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        match self {
+            BaseSort::BitVec(bitvec) => bitvec.to_tokens(tokens),
+            BaseSort::App(ctor, args) => {
+                ctor.to_tokens(tokens);
+                args.to_tokens(tokens);
+            }
+        }
+    }
+}
+
+impl ToTokens for BitVecSort {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        self.bitvec_token.to_tokens(tokens);
+        self.lt_token.to_tokens(tokens);
+        self.lit.to_tokens(tokens);
+        self.gt_token.to_tokens(tokens);
+    }
+}
+
+impl ToTokens for SortArguments {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        match self {
+            SortArguments::None => {}
+            SortArguments::AngleBracketed(args) => args.to_tokens(tokens),
+        }
+    }
+}
+
+impl ToTokens for AngleBracketedSortArgs {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        self.lt_token.to_tokens(tokens);
+        self.args.to_tokens(tokens);
+        self.gt_token.to_tokens(tokens);
+    }
+}
+
 impl ToTokens for ItemFn {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let ItemFn { attrs, vis, sig, block } = self;
@@ -1811,28 +1991,20 @@ impl ToTokens for ItemFn {
 
 impl ToTokens for ItemType {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        let flux_type = ToTokensFlux(self);
-        let rust_type = ToTokensRust(self);
-        quote! {
-            #[flux_tool::alias(#flux_type)]
-            #rust_type
-        }
-        .to_tokens(tokens);
+        #[cfg(flux_sysroot)]
+        self.flux_tool_attr().to_tokens(tokens);
+        self.to_tokens_inner(tokens, Mode::Rust);
     }
 }
 
+#[cfg(flux_sysroot)]
 impl ToTokens for ToTokensFlux<&ItemType> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         self.0.to_tokens_inner(tokens, Mode::Flux);
     }
 }
 
-impl ToTokens for ToTokensRust<&ItemType> {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-        self.0.to_tokens_inner(tokens, Mode::Rust);
-    }
-}
-
+#[cfg(flux_sysroot)]
 impl ToTokens for ToTokensFlux<&Type> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         self.0.to_tokens_inner(tokens, Mode::Flux);
@@ -1855,6 +2027,14 @@ impl ItemType {
         self.ty.to_tokens_inner(tokens, mode);
         if mode == Mode::Rust {
             self.semi_token.to_tokens(tokens);
+        }
+    }
+
+    #[cfg(flux_sysroot)]
+    fn flux_tool_attr(&self) -> TokenStream {
+        let flux_type = ToTokensFlux(self);
+        quote! {
+            #[flux_tool::alias(#flux_type)]
         }
     }
 }
@@ -2004,8 +2184,10 @@ impl ToTokens for ImplItemFn {
     }
 }
 
+#[cfg(flux_sysroot)]
 struct ToTokensFlux<T>(T);
 
+#[cfg(flux_sysroot)]
 impl ToTokens for ToTokensFlux<&Signature> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         self.0.to_tokens_inner(tokens, Mode::Flux);
@@ -2069,9 +2251,14 @@ impl Ensures {
 
 impl Constraint {
     fn to_tokens_inner(&self, tokens: &mut TokenStream) {
-        self.ident.to_tokens(tokens);
-        self.colon_token.to_tokens(tokens);
-        self.ty.to_tokens_inner(tokens, Mode::Flux);
+        match self {
+            Constraint::Type { ident, colon_token, ty } => {
+                ident.to_tokens(tokens);
+                colon_token.to_tokens(tokens);
+                ty.to_tokens_inner(tokens, Mode::Flux);
+            }
+            Constraint::Expr(e) => e.to_tokens(tokens),
+        }
     }
 }
 
@@ -2160,6 +2347,7 @@ impl Type {
             Type::Constraint(ty_constraint) => ty_constraint.to_tokens_inner(tokens, mode),
             Type::Array(ty_array) => ty_array.to_tokens_inner(tokens, mode),
             Type::Tuple(tuple) => tuple.to_tokens_inner(tokens, mode),
+            Type::Ptr(ty_ptr) => ty_ptr.to_tokens(tokens),
         }
     }
 }
@@ -2167,6 +2355,9 @@ impl Type {
 impl TypeReference {
     fn to_tokens_inner(&self, tokens: &mut TokenStream, mode: Mode) {
         self.and_token.to_tokens(tokens);
+        if mode == Mode::Rust {
+            self.lifetime.to_tokens(tokens);
+        }
         self.mutability.to_tokens(tokens);
         self.elem.to_tokens_inner(tokens, mode);
     }
@@ -2226,18 +2417,22 @@ impl TypeExists {
 
 impl TypeGeneralExists {
     fn to_tokens_inner(&self, tokens: &mut TokenStream, mode: Mode) {
-        self.ty.to_tokens_inner(tokens, mode);
-        if mode == Mode::Flux {
-            self.brace_token.surround(tokens, |tokens| {
-                for fn_arg in self.params.pairs() {
-                    fn_arg.value().to_tokens_inner(tokens);
-                    fn_arg.punct().to_tokens(tokens);
-                }
-                self.dot_token.to_tokens(tokens);
+        match mode {
+            Mode::Flux => {
+                self.brace_token.surround(tokens, |tokens| {
+                    for param in self.params.pairs() {
+                        param.value().to_tokens_inner(tokens);
+                        param.punct().to_tokens(tokens);
+                    }
+                    self.dot_token.to_tokens(tokens);
+                    self.ty.to_tokens_inner(tokens, mode);
+                    self.or_token.to_tokens(tokens);
+                    self.pred.to_tokens(tokens);
+                });
+            }
+            Mode::Rust => {
                 self.ty.to_tokens_inner(tokens, mode);
-                self.or_token.to_tokens(tokens);
-                self.pred.to_tokens(tokens);
-            });
+            }
         }
     }
 }

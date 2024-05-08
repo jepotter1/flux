@@ -21,6 +21,22 @@ middle_unsupported_generic_bound =
 
 # Query Errors
 
-middle_query_unsupported_type =
-    unsupported type
+middle_query_unsupported =
+    unsupported signature
     .note = {$reason}
+
+middle_query_invalid_generic_arg =
+    cannot instantiate base generic with opaque type or a type parameter of kind type
+
+middle_query_ignored_item =
+    use of ignored item
+
+# Query Errors reported at use site
+
+middle_query_unsupported_at =
+    use of unsupported {$kind}
+    .note = this {$kind} has unsupported features
+
+middle_query_ignored_at =
+    use of ignored {$kind} `{$name}`
+    .label = help: try ignoring or trusting this code

@@ -44,6 +44,16 @@ pub fn trusted(attr: TokenStream, tokens: TokenStream) -> TokenStream {
     attr_impl::trusted(attr, tokens)
 }
 
+#[proc_macro_attribute]
+pub fn generics(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::generics(attr, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn assoc(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::assoc(attr, tokens)
+}
+
 #[proc_macro]
 pub fn flux(tokens: TokenStream) -> TokenStream {
     flux_attrs::flux(tokens.into()).into()
@@ -57,6 +67,11 @@ pub fn defs(tokens: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn extern_spec(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
     attr_impl::extern_spec(attrs, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn ignore(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::ignore(attrs, tokens)
 }
 
 #[cfg(flux_sysroot)]
@@ -85,7 +100,9 @@ mod attr_sysroot {
         };
     }
 
-    flux_tool_attrs!(alias, sig, qualifiers, constant, invariant, opaque, trusted);
+    flux_tool_attrs!(
+        alias, sig, qualifiers, constant, invariant, opaque, trusted, generics, assoc, ignore
+    );
 }
 
 #[cfg(not(flux_sysroot))]
@@ -100,6 +117,10 @@ mod attr_dummy {
         TokenStream::new()
     }
 
+    pub fn extern_spec(_attrs: TokenStream, _tokens: TokenStream) -> TokenStream {
+        TokenStream::new()
+    }
+
     macro_rules! no_op {
         ($($name:ident),+ $(,)?) => {
             $(
@@ -110,5 +131,5 @@ mod attr_dummy {
         };
     }
 
-    no_op!(alias, sig, qualifiers, invariant, constant, opaque, trusted, extern_spec);
+    no_op!(alias, sig, qualifiers, invariant, constant, opaque, trusted, generics, assoc, ignore);
 }

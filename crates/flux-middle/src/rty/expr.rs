@@ -1,23 +1,79 @@
-use std::{fmt, iter, slice, sync::OnceLock};
+use std::{fmt, sync::OnceLock};
 
 use flux_common::bug;
-pub use flux_fixpoint::{BinOp, Constant, UnOp};
+pub use flux_fixpoint::Constant;
 use itertools::Itertools;
 use rustc_hir::def_id::DefId;
 use rustc_index::newtype_index;
 use rustc_macros::{Decodable, Encodable, TyDecodable, TyEncodable};
-use rustc_middle::mir::Local;
+use rustc_middle::{mir::Local, ty::TyCtxt};
 use rustc_span::{BytePos, Span, Symbol, SyntaxContext};
 use rustc_target::abi::FieldIdx;
 use rustc_type_ir::{DebruijnIndex, INNERMOST};
 
-use super::{evars::EVar, BaseTy, Binder, IntTy, Sort, UintTy};
-use crate::{
-    fhir::FuncKind,
-    intern::{impl_internable, impl_slice_internable, Interned, List},
-    rty::fold::{TypeFoldable, TypeFolder, TypeSuperFoldable},
-    rustc::mir::{Place, PlaceElem},
+use super::{
+    evars::EVar, BaseTy, Binder, BoundReftKind, BoundVariableKind, FuncSort, GenericArgs, IntTy,
+    Sort, UintTy,
 };
+use crate::{
+    fhir::SpecFuncKind,
+    intern::{impl_internable, impl_slice_internable, Interned, List},
+    rty::{
+        fold::{TypeFoldable, TypeFolder, TypeSuperFoldable},
+        SortCtor,
+    },
+};
+
+/// A lambda abstraction with an elaborated output sort
+#[derive(Clone, PartialEq, Eq, Hash, TyEncodable, TyDecodable)]
+pub struct Lambda {
+    pub(super) body: Binder<Expr>,
+    pub(super) output: Sort,
+}
+
+impl Lambda {
+    pub fn with_vars(body: Expr, inputs: List<BoundVariableKind>, output: Sort) -> Self {
+        Self { body: Binder::new(body, inputs), output }
+    }
+
+    pub fn with_sorts(body: Expr, inputs: &[Sort], output: Sort) -> Self {
+        Self { body: Binder::with_sorts(body, inputs), output }
+    }
+
+    pub fn apply(&self, args: &[Expr]) -> Expr {
+        self.body.replace_bound_refts(args)
+    }
+
+    pub fn inputs(&self) -> List<Sort> {
+        self.body.vars().to_sort_list()
+    }
+
+    pub fn output(&self) -> Sort {
+        self.output.clone()
+    }
+
+    pub fn sort(&self) -> FuncSort {
+        FuncSort::new(self.inputs().to_vec(), self.output())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, TyEncodable, TyDecodable)]
+pub struct AliasReft {
+    pub trait_id: DefId,
+    pub name: Symbol,
+    pub args: GenericArgs,
+}
+
+impl AliasReft {
+    pub fn to_rustc_trait_ref<'tcx>(&self, tcx: TyCtxt<'tcx>) -> rustc_middle::ty::TraitRef<'tcx> {
+        let trait_def_id = self.trait_id;
+        let args = self
+            .args
+            .to_rustc(tcx)
+            .truncate_to(tcx, tcx.generics_of(trait_def_id));
+        rustc_middle::ty::TraitRef::new(tcx, trait_def_id, args)
+    }
+}
 
 pub type Expr = Interned<ExprS>;
 
@@ -73,41 +129,95 @@ impl SpanData {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, TyEncodable, TyDecodable)]
+pub enum BinOp {
+    Iff,
+    Imp,
+    Or,
+    And,
+    Eq,
+    Ne,
+    Gt(Sort),
+    Ge(Sort),
+    Lt(Sort),
+    Le(Sort),
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Encodable, Decodable)]
+pub enum UnOp {
+    Not,
+    Neg,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, TyEncodable, TyDecodable)]
 pub enum ExprKind {
     Var(Var),
     Local(Local),
     Constant(Constant),
     ConstDefId(DefId),
     BinaryOp(BinOp, Expr, Expr),
-    App(Expr, List<Expr>),
-    GlobalFunc(Symbol, FuncKind),
+    GlobalFunc(Symbol, SpecFuncKind),
     UnaryOp(UnOp, Expr),
-    TupleProj(Expr, u32),
-    Tuple(List<Expr>),
+    FieldProj(Expr, FieldProj),
+    Aggregate(AggregateKind, List<Expr>),
     PathProj(Expr, FieldIdx),
     IfThenElse(Expr, Expr, Expr),
     KVar(KVar),
+    Alias(AliasReft, List<Expr>),
+    /// Function application. The syntax allows arbitrary expressions in function position, but in
+    /// practice we are restricted by what's possible to encode in fixpoint. In a nutshell, we need
+    /// to make sure that expressions that can't be encoded are eliminated before we generate the
+    /// fixpoint constraint. Most notably, lambda abstractions have to be fully applied before
+    /// encoding into fixpoint (except when they appear as an index at the top-level).
+    App(Expr, List<Expr>),
     /// Lambda abstractions. They are purely syntactic and we don't encode them in the logic. As such,
     /// they have some syntactic restrictions that we must carefully maintain:
     ///
     /// 1. They can appear as an index at the top level.
     /// 2. We can only substitute an abstraction for a variable in function position (or as an index).
     ///    More generaly, we need to partially evaluate expressions such that all abstractions in
-    ///    non-index position are eliminated before encoding into fixpoint. Right now, the implementation
-    ///    only evaluates abstractions that are immediately applied to arguments, thus the restriction.
-    Abs(Binder<Expr>),
+    ///    non-index position are eliminated before encoding into fixpoint. Right now, the
+    ///    implementation only evaluates abstractions that are immediately applied to arguments,
+    ///    thus the restriction.
+    Abs(Lambda),
     /// A hole is an expression that must be inferred either *semantically* by generating a kvar or
-    /// *syntactically* by generating an evar. Whether a hole can be inferred semantically or syntactically
-    /// depends on the position it appears: only holes appearing in predicate position can be inferred
-    /// with a kvar (provided it satisfy the fixpoint horn constraints) and only holes used as a refinement
-    /// argument or index (a position that fully determines their value) can be inferred with an evar.
+    /// *syntactically* by generating an evar. Whether a hole can be inferred semantically or
+    /// syntactically depends on the position it appears: only holes appearing in predicate position
+    /// can be inferred with a kvar (provided it satisfies the fixpoint horn constraints) and only
+    /// holes used as an index (a position that fully determines their value) can be inferred with
+    /// an evar.
     ///
-    /// Holes are implicitly defined in a scope, i.e., their solution could mention free and bound variables
-    /// in this scope. This must be considered when generating an inference variables for them (either evar or kvar).
-    /// In fact, the main reason we have holes is that we want to decouple the places where we generate them,
-    /// (where we don't want to worry about the scope) and the places where we infer them (where we do need to worry
+    /// Holes are implicitly defined in a scope, i.e., their solution could mention free and bound
+    /// variables in this scope. This must be considered when generating an inference variables for
+    /// them (either evar or kvar). In fact, the main reason we have holes is that we want to
+    /// decouple the places where we generate holes (where we don't want to worry about the scope),
+    /// and the places where we generate inference variable for them (where we do need to worry
     /// about the scope).
     Hole(HoleKind),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, TyEncodable, TyDecodable, Debug)]
+pub enum AggregateKind {
+    Tuple,
+    Adt(DefId),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, TyEncodable, TyDecodable, Debug)]
+pub enum FieldProj {
+    Tuple { arity: usize, field: u32 },
+    Adt { def_id: DefId, field: u32 },
+}
+
+impl FieldProj {
+    pub fn field(&self) -> u32 {
+        match self {
+            FieldProj::Tuple { field, .. } | FieldProj::Adt { field, .. } => *field,
+        }
+    }
 }
 
 /// The position where a hole appears. This determines how it will be inferred. This is related but not
@@ -141,10 +251,22 @@ pub struct KVar {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Encodable, Decodable)]
+pub struct EarlyReftParam {
+    pub index: u32,
+    pub name: Symbol,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Encodable, Decodable, Debug)]
+pub struct BoundReft {
+    pub index: u32,
+    pub kind: BoundReftKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Encodable, Decodable)]
 pub enum Var {
     Free(Name),
-    LateBound(DebruijnIndex, u32),
-    EarlyBound(u32),
+    LateBound(DebruijnIndex, BoundReft),
+    EarlyParam(EarlyReftParam),
     EVar(EVar),
 }
 
@@ -162,11 +284,14 @@ pub enum Loc {
 
 newtype_index! {
     #[debug_format = "$k{}"]
+    #[encodable]
     pub struct KVid {}
 }
 
 newtype_index! {
     #[debug_format = "a{}"]
+    #[orderable]
+    #[encodable]
     pub struct Name {}
 }
 
@@ -229,12 +354,6 @@ impl Expr {
             .clone()
     }
 
-    pub fn one() -> Expr {
-        static ONE: OnceLock<Expr> = OnceLock::new();
-        ONE.get_or_init(|| ExprKind::Constant(Constant::ONE).intern())
-            .clone()
-    }
-
     pub fn int_max(int_ty: IntTy) -> Expr {
         let bit_width: u64 = int_ty
             .bit_width()
@@ -257,27 +376,30 @@ impl Expr {
     }
 
     pub fn nu() -> Expr {
-        Expr::late_bvar(INNERMOST, 0)
+        Expr::late_bvar(INNERMOST, 0, BoundReftKind::Annon)
     }
 
-    pub fn as_tuple(&self) -> &[Expr] {
-        if let ExprKind::Tuple(tup) = self.kind() {
-            tup
+    pub fn is_nu(&self) -> bool {
+        if let ExprKind::Var(Var::LateBound(INNERMOST, var)) = self.kind()
+            && var.index == 0
+        {
+            true
         } else {
-            slice::from_ref(self)
+            false
         }
     }
 
-    pub fn expect_tuple(&self) -> &[Expr] {
-        if let ExprKind::Tuple(tup) = self.kind() {
-            tup
+    #[track_caller]
+    pub fn expect_adt(&self) -> (DefId, List<Expr>) {
+        if let ExprKind::Aggregate(AggregateKind::Adt(def_id), flds) = self.kind() {
+            (*def_id, flds.clone())
         } else {
-            bug!("expected tuple")
+            bug!("expected record, found {self:?}")
         }
     }
 
     pub fn unit() -> Expr {
-        Expr::tuple(vec![])
+        Expr::tuple(List::empty())
     }
 
     pub fn var(var: Var, espan: Option<ESpan>) -> Expr {
@@ -292,12 +414,12 @@ impl Expr {
         Var::EVar(evar).to_expr()
     }
 
-    pub fn late_bvar(bvar: DebruijnIndex, idx: u32) -> Expr {
-        Var::LateBound(bvar, idx).to_expr()
+    pub fn late_bvar(debruijn: DebruijnIndex, index: u32, kind: BoundReftKind) -> Expr {
+        Var::LateBound(debruijn, BoundReft { index, kind }).to_expr()
     }
 
-    pub fn early_bvar(idx: u32) -> Expr {
-        Var::EarlyBound(idx).to_expr()
+    pub fn early_param(index: u32, name: Symbol) -> Expr {
+        Var::EarlyParam(EarlyReftParam { index, name }).to_expr()
     }
 
     pub fn local(local: Local, espan: Option<ESpan>) -> Expr {
@@ -316,8 +438,16 @@ impl Expr {
         ExprKind::ConstDefId(c).intern_at(espan)
     }
 
-    pub fn tuple(exprs: impl Into<List<Expr>>) -> Expr {
-        ExprKind::Tuple(exprs.into()).intern()
+    pub fn aggregate(kind: AggregateKind, flds: List<Expr>) -> Expr {
+        ExprKind::Aggregate(kind, flds).intern()
+    }
+
+    pub fn tuple(flds: List<Expr>) -> Expr {
+        Expr::aggregate(AggregateKind::Tuple, flds)
+    }
+
+    pub fn adt(def_id: DefId, flds: List<Expr>) -> Expr {
+        ExprKind::Aggregate(AggregateKind::Adt(def_id), flds).intern()
     }
 
     pub fn from_bits(bty: &BaseTy, bits: u128) -> Expr {
@@ -342,8 +472,8 @@ impl Expr {
         ExprKind::IfThenElse(p.into(), e1.into(), e2.into()).intern_at(espan)
     }
 
-    pub fn abs(body: Binder<Expr>) -> Expr {
-        ExprKind::Abs(body).intern()
+    pub fn abs(lam: Lambda) -> Expr {
+        ExprKind::Abs(lam).intern()
     }
 
     pub fn hole(kind: HoleKind) -> Expr {
@@ -352,6 +482,10 @@ impl Expr {
 
     pub fn kvar(kvar: KVar) -> Expr {
         ExprKind::KVar(kvar).intern()
+    }
+
+    pub fn alias(alias: AliasReft, args: List<Expr>) -> Expr {
+        ExprKind::Alias(alias, args).intern()
     }
 
     pub fn binary_op(
@@ -363,11 +497,15 @@ impl Expr {
         ExprKind::BinaryOp(op, e1.into(), e2.into()).intern_at(espan)
     }
 
+    pub fn unit_adt(def_id: DefId) -> Expr {
+        Expr::adt(def_id, List::empty())
+    }
+
     pub fn app(func: impl Into<Expr>, args: impl Into<List<Expr>>, espan: Option<ESpan>) -> Expr {
         ExprKind::App(func.into(), args.into()).intern_at(espan)
     }
 
-    pub fn global_func(func: Symbol, kind: FuncKind) -> Expr {
+    pub fn global_func(func: Symbol, kind: SpecFuncKind) -> Expr {
         ExprKind::GlobalFunc(func, kind).intern()
     }
 
@@ -388,34 +526,34 @@ impl Expr {
     }
 
     pub fn ge(e1: impl Into<Expr>, e2: impl Into<Expr>) -> Expr {
-        ExprKind::BinaryOp(BinOp::Ge, e1.into(), e2.into()).intern()
+        ExprKind::BinaryOp(BinOp::Ge(Sort::Int), e1.into(), e2.into()).intern()
     }
 
     pub fn gt(e1: impl Into<Expr>, e2: impl Into<Expr>) -> Expr {
-        ExprKind::BinaryOp(BinOp::Gt, e1.into(), e2.into()).intern()
+        ExprKind::BinaryOp(BinOp::Gt(Sort::Int), e1.into(), e2.into()).intern()
     }
 
     pub fn lt(e1: impl Into<Expr>, e2: impl Into<Expr>) -> Expr {
-        ExprKind::BinaryOp(BinOp::Lt, e1.into(), e2.into()).intern()
+        ExprKind::BinaryOp(BinOp::Lt(Sort::Int), e1.into(), e2.into()).intern()
     }
 
     pub fn le(e1: impl Into<Expr>, e2: impl Into<Expr>) -> Expr {
-        ExprKind::BinaryOp(BinOp::Le, e1.into(), e2.into()).intern()
+        ExprKind::BinaryOp(BinOp::Le(Sort::Int), e1.into(), e2.into()).intern()
     }
 
     pub fn implies(e1: impl Into<Expr>, e2: impl Into<Expr>) -> Expr {
         ExprKind::BinaryOp(BinOp::Imp, e1.into(), e2.into()).intern()
     }
 
-    pub fn tuple_proj(e: impl Into<Expr>, proj: u32, espan: Option<ESpan>) -> Expr {
-        ExprKind::TupleProj(e.into(), proj).intern_at(espan)
+    pub fn field_proj(e: impl Into<Expr>, proj: FieldProj, espan: Option<ESpan>) -> Expr {
+        ExprKind::FieldProj(e.into(), proj).intern_at(espan)
     }
 
-    pub fn tuple_projs(e: impl Into<Expr>, projs: &[u32]) -> Expr {
+    pub fn field_projs(e: impl Into<Expr>, projs: &[FieldProj]) -> Expr {
         projs
             .iter()
             .copied()
-            .fold(e.into(), |e, p| Expr::tuple_proj(e, p, None))
+            .fold(e.into(), |e, p| Expr::field_proj(e, p, None))
     }
 
     pub fn path_proj(base: Expr, field: FieldIdx) -> Expr {
@@ -437,19 +575,18 @@ impl Expr {
     /// An expression is an *atom* if it is "self-delimiting", i.e., it has a clear boundary
     /// when printed. This is used to avoid unnecesary parenthesis when pretty printing.
     pub fn is_atom(&self) -> bool {
-        !self.is_binary_op()
+        !matches!(self.kind, ExprKind::Abs(..) | ExprKind::BinaryOp(..))
     }
 
     /// Simple syntactic check to see if the expression is a trivially true predicate. This is used
-    /// mostly for filtering predicates when pretty printing but also to simplify the constraint
-    /// before encoding it into fixpoint.
+    /// mostly for filtering predicates when pretty printing but also to simplify types in general.
     pub fn is_trivially_true(&self) -> bool {
         self.is_true()
             || matches!(self.kind(), ExprKind::BinaryOp(BinOp::Eq | BinOp::Iff | BinOp::Imp, e1, e2) if e1 == e2)
     }
 
     /// Whether the expression is *literally* the constant true.
-    pub fn is_true(&self) -> bool {
+    fn is_true(&self) -> bool {
         matches!(self.kind, ExprKind::Constant(Constant::Bool(true)))
     }
 
@@ -463,10 +600,10 @@ impl Expr {
             BinOp::Imp => c1.imp(c2),
             BinOp::Or => c1.or(c2),
             BinOp::And => c1.and(c2),
-            BinOp::Gt => c1.gt(c2),
-            BinOp::Ge => c1.ge(c2),
-            BinOp::Lt => c2.gt(c1),
-            BinOp::Le => c2.ge(c1),
+            BinOp::Gt(Sort::Int) => c1.gt(c2),
+            BinOp::Ge(Sort::Int) => c1.ge(c2),
+            BinOp::Lt(Sort::Int) => c2.gt(c1),
+            BinOp::Le(Sort::Int) => c2.ge(c1),
             BinOp::Eq => Some(c1.eq(c2)),
             BinOp::Ne => Some(c1.ne(c2)),
             _ => None,
@@ -501,10 +638,10 @@ impl Expr {
                                 let e2_span = e2.span();
                                 match Expr::const_op(op, c1, c2) {
                                     Some(c) => Expr::constant_at(c, span.or(e2_span)),
-                                    None => Expr::binary_op(*op, e1, e2, span),
+                                    None => Expr::binary_op(op.clone(), e1, e2, span),
                                 }
                             }
-                            _ => Expr::binary_op(*op, e1, e2, span),
+                            _ => Expr::binary_op(op.clone(), e1, e2, span),
                         }
                     }
                     ExprKind::UnaryOp(UnOp::Not, e) => {
@@ -525,14 +662,6 @@ impl Expr {
             }
         }
         self.fold_with(&mut Simplify)
-    }
-
-    pub fn to_var(&self) -> Option<Var> {
-        if let ExprKind::Var(var) = self.kind() {
-            Some(*var)
-        } else {
-            None
-        }
     }
 
     pub fn to_loc(&self) -> Option<Loc> {
@@ -558,56 +687,39 @@ impl Expr {
         matches!(self.kind(), ExprKind::Abs(..))
     }
 
-    pub fn is_tuple(&self) -> bool {
-        matches!(self.kind(), ExprKind::Tuple(..))
+    /// Wether this is an aggregate expression with no fields.
+    pub fn is_unit(&self) -> bool {
+        matches!(self.kind(), ExprKind::Aggregate(_, flds) if flds.is_empty())
     }
 
-    pub fn eta_expand_abs(&self, sorts: &[Sort]) -> Binder<Expr> {
-        let args = (0..sorts.len())
-            .map(|idx| Expr::late_bvar(INNERMOST, idx as u32))
+    pub fn eta_expand_abs(&self, inputs: &[Sort], output: Sort) -> Lambda {
+        let args = (0..inputs.len())
+            .map(|idx| Expr::late_bvar(INNERMOST, idx as u32, BoundReftKind::Annon))
             .collect_vec();
-        Binder::with_sorts(Expr::app(self, args, None), sorts.iter().cloned())
-    }
-
-    pub fn eta_expand_tuple(&self, sort: &Sort) -> Expr {
-        fn go(sort: &Sort, projs: &mut Vec<u32>, f: &impl Fn(&[u32]) -> Expr) -> Expr {
-            if let Sort::Tuple(sorts) = sort {
-                Expr::tuple(
-                    sorts
-                        .iter()
-                        .enumerate()
-                        .map(|(i, sort)| {
-                            projs.push(i as u32);
-                            let e = go(sort, projs, f);
-                            projs.pop();
-                            e
-                        })
-                        .collect_vec(),
-                )
-            } else {
-                f(projs)
-            }
-        }
-        if let (ExprKind::Tuple(exprs), Sort::Tuple(sorts)) = (self.kind(), sort) {
-            Expr::tuple(
-                iter::zip(exprs, sorts)
-                    .map(|(e, s)| e.eta_expand_tuple(s))
-                    .collect_vec(),
-            )
-        } else {
-            go(sort, &mut vec![], &|projs| Expr::tuple_projs(self, projs))
-        }
+        let body = Expr::app(self, args, None);
+        Lambda::with_sorts(body, inputs, output)
     }
 
     pub fn fold_sort(sort: &Sort, mut f: impl FnMut(&Sort) -> Expr) -> Expr {
         fn go(sort: &Sort, f: &mut impl FnMut(&Sort) -> Expr) -> Expr {
-            if let Sort::Tuple(sorts) = sort {
-                Expr::tuple(sorts.iter().map(|sort| go(sort, f)).collect_vec())
-            } else {
-                f(sort)
+            match sort {
+                Sort::Tuple(sorts) => Expr::tuple(sorts.iter().map(|sort| go(sort, f)).collect()),
+                Sort::App(SortCtor::Adt(adt_sort_def), args) => {
+                    let flds = adt_sort_def.sorts(args);
+                    Expr::adt(adt_sort_def.did(), flds.iter().map(|sort| go(sort, f)).collect())
+                }
+                _ => f(sort),
             }
         }
         go(sort, &mut f)
+    }
+
+    /// Applies a projection to an expression and optimistically try to beta reduce it if possible.
+    pub fn proj_and_reduce(&self, proj: FieldProj) -> Expr {
+        match self.kind() {
+            ExprKind::Aggregate(_, flds) => flds[proj.field() as usize].clone(),
+            _ => Expr::field_proj(self.clone(), proj, None),
+        }
     }
 }
 
@@ -634,18 +746,6 @@ impl Var {
 impl Path {
     pub fn new(loc: Loc, projection: impl Into<List<FieldIdx>>) -> Path {
         Path { loc, projection: projection.into() }
-    }
-
-    pub fn from_place(place: &Place) -> Option<Path> {
-        let mut proj = vec![];
-        for elem in &place.projection {
-            if let PlaceElem::Field(field) = elem {
-                proj.push(*field);
-            } else {
-                return None;
-            }
-        }
-        Some(Path::new(Loc::Local(place.local), proj))
     }
 
     pub fn projection(&self) -> &[FieldIdx] {
@@ -727,6 +827,12 @@ impl From<Name> for Expr {
     }
 }
 
+impl From<Var> for Expr {
+    fn from(var: Var) -> Self {
+        Expr::var(var, None)
+    }
+}
+
 impl From<Loc> for Path {
     fn from(loc: Loc) -> Self {
         Path::new(loc, vec![])
@@ -753,7 +859,7 @@ mod pretty {
     use crate::pretty::*;
 
     #[derive(PartialEq, Eq, PartialOrd, Ord)]
-    pub enum Precedence {
+    enum Precedence {
         Iff,
         Imp,
         Or,
@@ -763,17 +869,22 @@ mod pretty {
         MulDiv,
     }
 
-    pub fn precedence(bin_op: &BinOp) -> Precedence {
-        match bin_op {
-            BinOp::Iff => Precedence::Iff,
-            BinOp::Imp => Precedence::Imp,
-            BinOp::Or => Precedence::Or,
-            BinOp::And => Precedence::And,
-            BinOp::Eq | BinOp::Ne | BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le => {
-                Precedence::Cmp
+    impl BinOp {
+        fn precedence(&self) -> Precedence {
+            match self {
+                BinOp::Iff => Precedence::Iff,
+                BinOp::Imp => Precedence::Imp,
+                BinOp::Or => Precedence::Or,
+                BinOp::And => Precedence::And,
+                BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Gt(_)
+                | BinOp::Lt(_)
+                | BinOp::Ge(_)
+                | BinOp::Le(_) => Precedence::Cmp,
+                BinOp::Add | BinOp::Sub => Precedence::AddSub,
+                BinOp::Mul | BinOp::Div | BinOp::Mod => Precedence::MulDiv,
             }
-            BinOp::Add | BinOp::Sub => Precedence::AddSub,
-            BinOp::Mul | BinOp::Div | BinOp::Mod => Precedence::MulDiv,
         }
     }
 
@@ -784,13 +895,13 @@ mod pretty {
     }
 
     impl Pretty for Expr {
-        fn fmt(&self, cx: &PPrintCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt(&self, cx: &PrettyCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             define_scoped!(cx, f);
             fn should_parenthesize(op: &BinOp, child: &Expr) -> bool {
                 if let ExprKind::BinaryOp(child_op, ..) = child.kind() {
-                    precedence(child_op) < precedence(op)
-                        || (precedence(child_op) == precedence(op)
-                            && !precedence(op).is_associative())
+                    child_op.precedence() < op.precedence()
+                        || (child_op.precedence() == op.precedence()
+                            && !op.precedence().is_associative())
                 } else {
                     false
                 }
@@ -820,35 +931,38 @@ mod pretty {
                     Ok(())
                 }
                 ExprKind::UnaryOp(op, e) => {
-                    if e.is_binary_op() {
-                        w!("{:?}({:?})", op, e)
-                    } else {
+                    if e.is_atom() {
                         w!("{:?}{:?}", op, e)
-                    }
-                }
-                ExprKind::TupleProj(e, field) => {
-                    if e.is_binary_op() {
-                        w!("({:?}).{:?}", e, ^field)
                     } else {
-                        w!("{:?}.{:?}", e, ^field)
+                        w!("{:?}({:?})", op, e)
                     }
                 }
-                ExprKind::Tuple(exprs) => {
-                    if let [e] = &exprs[..] {
+                ExprKind::FieldProj(e, proj) => {
+                    if e.is_atom() {
+                        w!("{:?}.{:?}", e, ^proj.field())
+                    } else {
+                        w!("({:?}).{:?}", e, ^proj.field())
+                    }
+                }
+                ExprKind::Aggregate(AggregateKind::Tuple, flds) => {
+                    if let [e] = &flds[..] {
                         w!("({:?},)", e)
                     } else {
-                        w!("({:?})", join!(", ", exprs))
+                        w!("({:?})", join!(", ", flds))
                     }
                 }
+                ExprKind::Aggregate(AggregateKind::Adt(def_id), flds) => {
+                    w!("{:?} {{ {:?} }}", def_id, join!(", ", flds))
+                }
                 ExprKind::PathProj(e, field) => {
-                    if e.is_binary_op() {
-                        w!("({:?}).{:?}", e, field)
-                    } else {
+                    if e.is_atom() {
                         w!("{:?}.{:?}", e, field)
+                    } else {
+                        w!("({:?}).{:?}", e, field)
                     }
                 }
                 ExprKind::App(func, args) => {
-                    w!("{:?}({})",
+                    w!("({:?})({})",
                         func,
                         ^args
                             .iter()
@@ -864,20 +978,46 @@ mod pretty {
                 ExprKind::KVar(kvar) => {
                     w!("{:?}", kvar)
                 }
-                ExprKind::Abs(body) => {
-                    w!("{:?}", body)
+                ExprKind::Alias(alias, args) => {
+                    w!("{:?}({:?})", alias, join!(", ", args))
+                }
+                ExprKind::Abs(lam) => {
+                    w!("{:?}", lam)
                 }
                 ExprKind::GlobalFunc(func, _) => w!("{}", ^func),
             }
         }
     }
 
+    impl Pretty for AliasReft {
+        fn fmt(&self, cx: &PrettyCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            define_scoped!(cx, f);
+            w!("<({:?}) as {:?}", &self.args[0], self.trait_id)?;
+            let args = &self.args[1..];
+            if !args.is_empty() {
+                w!("<{:?}>", join!(", ", args))?;
+            }
+            w!(">::{}", ^self.name)
+        }
+    }
+
+    impl Pretty for Lambda {
+        fn fmt(&self, cx: &PrettyCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            define_scoped!(cx, f);
+            let vars = self.body.vars();
+            cx.with_bound_vars(vars, || {
+                cx.fmt_bound_vars("λ", vars, ". ", f)?;
+                w!("{:?}", self.body.as_ref().skip_binder())
+            })
+        }
+    }
+
     impl Pretty for Var {
-        fn fmt(&self, cx: &PPrintCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt(&self, cx: &PrettyCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             define_scoped!(cx, f);
             match self {
-                Var::LateBound(bvar, idx) => w!("{:?}#{}", bvar, ^idx),
-                Var::EarlyBound(idx) => w!("#{}", ^idx),
+                Var::LateBound(debruijn, var) => cx.fmt_bound_reft(*debruijn, *var, f),
+                Var::EarlyParam(var) => w!("{}", ^var.name),
                 Var::Free(name) => w!("{:?}", ^name),
                 Var::EVar(evar) => w!("{:?}", evar),
             }
@@ -885,7 +1025,7 @@ mod pretty {
     }
 
     impl Pretty for KVar {
-        fn fmt(&self, cx: &PPrintCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt(&self, cx: &PrettyCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             define_scoped!(cx, f);
             w!("{:?}", ^self.kvid)?;
             match cx.kvar_args {
@@ -900,7 +1040,7 @@ mod pretty {
     }
 
     impl Pretty for Path {
-        fn fmt(&self, cx: &PPrintCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt(&self, cx: &PrettyCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             define_scoped!(cx, f);
             w!("{:?}", &self.loc)?;
             for field in &self.projection {
@@ -911,7 +1051,7 @@ mod pretty {
     }
 
     impl Pretty for Loc {
-        fn fmt(&self, cx: &PPrintCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt(&self, cx: &PrettyCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             define_scoped!(cx, f);
             match self {
                 Loc::Local(local) => w!("{:?}", ^local),
@@ -921,7 +1061,7 @@ mod pretty {
     }
 
     impl Pretty for BinOp {
-        fn fmt(&self, _cx: &PPrintCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt(&self, _cx: &PrettyCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             define_scoped!(cx, f);
             match self {
                 BinOp::Iff => w!("⇔"),
@@ -930,10 +1070,10 @@ mod pretty {
                 BinOp::And => w!("∧"),
                 BinOp::Eq => w!("="),
                 BinOp::Ne => w!("≠"),
-                BinOp::Gt => w!(">"),
-                BinOp::Ge => w!("≥"),
-                BinOp::Lt => w!("<"),
-                BinOp::Le => w!("≤"),
+                BinOp::Gt(_) => w!(">"),
+                BinOp::Ge(_) => w!("≥"),
+                BinOp::Lt(_) => w!("<"),
+                BinOp::Le(_) => w!("≤"),
                 BinOp::Add => w!("+"),
                 BinOp::Sub => w!("-"),
                 BinOp::Mul => w!("*"),
@@ -944,7 +1084,7 @@ mod pretty {
     }
 
     impl Pretty for UnOp {
-        fn fmt(&self, _cx: &PPrintCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt(&self, _cx: &PrettyCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             define_scoped!(cx, f);
             match self {
                 UnOp::Not => w!("¬"),
@@ -953,5 +1093,5 @@ mod pretty {
         }
     }
 
-    impl_debug_with_default_cx!(Expr, Loc, Path, Var, KVar);
+    impl_debug_with_default_cx!(Expr, Loc, Path, Var, KVar, Lambda, AliasReft);
 }

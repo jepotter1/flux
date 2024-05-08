@@ -1,8 +1,12 @@
 use super::{
-    BaseTy, BaseTyKind, Constraint, EnumDef, Expr, ExprKind, FieldDef, FnOutput, FnSig, FuncSort,
-    GenericArg, Ident, Lifetime, Lit, Path, PolyFuncSort, QPath, RefineArg, RefineParam, Sort,
-    StructDef, Ty, TyKind, TypeBinding, VariantDef, VariantRet,
+    AliasReft, BaseTy, BaseTyKind, Constraint, EnumDef, Expr, ExprKind, FieldDef, FnDecl, FnOutput,
+    FnSig, FuncSort, GenericArg, GenericBound, Generics, ImplAssocReft, ImplItem, ImplItemKind,
+    Item, ItemKind, Lifetime, Lit, Node, OpaqueTy, Path, PathExpr, PathSegment, PolyFuncSort,
+    PolyTraitRef, QPath, RefineArg, RefineArgKind, RefineParam, Sort, SortPath, StructDef,
+    TraitAssocReft, TraitItem, TraitItemKind, Ty, TyAlias, TyKind, TypeBinding, VariantDef,
+    VariantRet, WhereBoundPredicate,
 };
+use crate::fhir::StructKind;
 
 #[macro_export]
 macro_rules! walk_list {
@@ -17,6 +21,38 @@ macro_rules! walk_list {
 }
 
 pub trait Visitor: Sized {
+    fn visit_node(&mut self, node: &Node) {
+        walk_node(self, node);
+    }
+
+    fn visit_item(&mut self, item: &Item) {
+        walk_item(self, item);
+    }
+
+    fn visit_trait_item(&mut self, trait_item: &TraitItem) {
+        walk_trait_item(self, trait_item);
+    }
+
+    fn visit_impl_item(&mut self, impl_item: &ImplItem) {
+        walk_impl_item(self, impl_item);
+    }
+
+    fn visit_generics(&mut self, generics: &Generics) {
+        walk_generics(self, generics);
+    }
+
+    fn visit_where_predicate(&mut self, predicate: &WhereBoundPredicate) {
+        walk_where_predicate(self, predicate);
+    }
+
+    fn visit_impl_assoc_reft(&mut self, assoc_reft: &ImplAssocReft) {
+        walk_impl_assoc_reft(self, assoc_reft);
+    }
+
+    fn visit_trait_assoc_reft(&mut self, assoc_reft: &TraitAssocReft) {
+        walk_trait_assoc_reft(self, assoc_reft);
+    }
+
     fn visit_struct_def(&mut self, struct_def: &StructDef) {
         walk_struct_def(self, struct_def);
     }
@@ -37,8 +73,28 @@ pub trait Visitor: Sized {
         walk_variant_ret(self, ret);
     }
 
+    fn visit_ty_alias(&mut self, ty_alias: &TyAlias) {
+        walk_ty_alias(self, ty_alias);
+    }
+
+    fn visit_opaque_ty(&mut self, opaque_ty: &OpaqueTy) {
+        walk_opaque_ty(self, opaque_ty);
+    }
+
+    fn visit_generic_bound(&mut self, bound: &GenericBound) {
+        walk_generic_bound(self, bound);
+    }
+
+    fn visit_poly_trait_ref(&mut self, trait_ref: &PolyTraitRef) {
+        walk_poly_trait_ref(self, trait_ref);
+    }
+
     fn visit_fn_sig(&mut self, sig: &FnSig) {
         walk_fn_sig(self, sig);
+    }
+
+    fn visit_fn_decl(&mut self, decl: &FnDecl) {
+        walk_fn_decl(self, decl);
     }
 
     fn visit_refine_param(&mut self, param: &RefineParam) {
@@ -71,12 +127,24 @@ pub trait Visitor: Sized {
         walk_qpath(self, qpath);
     }
 
+    fn visit_path(&mut self, path: &Path) {
+        walk_path(self, path);
+    }
+
+    fn visit_path_segment(&mut self, segment: &PathSegment) {
+        walk_path_segment(self, segment);
+    }
+
     fn visit_type_binding(&mut self, binding: &TypeBinding) {
         walk_type_binding(self, binding);
     }
 
     fn visit_sort(&mut self, sort: &Sort) {
         walk_sort(self, sort);
+    }
+
+    fn visit_sort_path(&mut self, path: &SortPath) {
+        walk_sort_path(self, path);
     }
 
     fn visit_poly_func_sort(&mut self, func: &PolyFuncSort) {
@@ -95,29 +163,33 @@ pub trait Visitor: Sized {
         walk_expr(self, expr);
     }
 
+    fn visit_alias_pred(&mut self, alias_pred: &AliasReft) {
+        walk_alias_pred(self, alias_pred);
+    }
+
     fn visit_literal(&mut self, _lit: &Lit) {}
 
-    fn visit_ident(&mut self, _ident: Ident) {}
+    fn visit_path_expr(&mut self, _path: &PathExpr) {}
 }
 
 pub fn walk_struct_def<V: Visitor>(vis: &mut V, struct_def: &StructDef) {
-    let StructDef { owner_id: _, params, kind: _, invariants } = struct_def;
-    walk_list!(vis, visit_refine_param, params);
-    walk_list!(vis, visit_expr, invariants);
+    walk_list!(vis, visit_refine_param, struct_def.params);
+    walk_list!(vis, visit_expr, struct_def.invariants);
+    if let StructKind::Transparent { fields } = struct_def.kind {
+        walk_list!(vis, visit_field_def, fields);
+    }
 }
 
 pub fn walk_enum_def<V: Visitor>(vis: &mut V, enum_def: &EnumDef) {
-    let EnumDef { owner_id: _, params, variants, invariants, .. } = enum_def;
-    walk_list!(vis, visit_refine_param, params);
-    walk_list!(vis, visit_variant, variants);
-    walk_list!(vis, visit_expr, invariants);
+    walk_list!(vis, visit_refine_param, enum_def.params);
+    walk_list!(vis, visit_variant, enum_def.variants);
+    walk_list!(vis, visit_expr, enum_def.invariants);
 }
 
 pub fn walk_variant<V: Visitor>(vis: &mut V, variant: &VariantDef) {
-    let VariantDef { def_id: _, params, fields, ret, span: _, lifted: _ } = variant;
-    walk_list!(vis, visit_refine_param, params);
-    walk_list!(vis, visit_field_def, fields);
-    vis.visit_variant_ret(ret);
+    walk_list!(vis, visit_refine_param, variant.params);
+    walk_list!(vis, visit_field_def, variant.fields);
+    vis.visit_variant_ret(&variant.ret);
 }
 
 pub fn walk_field_def<V: Visitor>(vis: &mut V, field: &FieldDef) {
@@ -131,24 +203,119 @@ pub fn walk_variant_ret<V: Visitor>(vis: &mut V, ret: &VariantRet) {
     vis.visit_refine_arg(idx);
 }
 
+pub fn walk_ty_alias<V: Visitor>(vis: &mut V, ty_alias: &TyAlias) {
+    vis.visit_generics(&ty_alias.generics);
+    vis.visit_ty(&ty_alias.ty);
+    walk_list!(vis, visit_refine_param, ty_alias.params);
+}
+
+pub fn walk_opaque_ty<V: Visitor>(vis: &mut V, opaque_ty: &OpaqueTy) {
+    vis.visit_generics(&opaque_ty.generics);
+    walk_list!(vis, visit_generic_bound, opaque_ty.bounds);
+}
+
+pub fn walk_generic_bound<V: Visitor>(vis: &mut V, bound: &GenericBound) {
+    match bound {
+        GenericBound::Trait(trait_ref, _) => vis.visit_poly_trait_ref(trait_ref),
+        GenericBound::LangItemTrait(_, args, bindings) => {
+            walk_list!(vis, visit_generic_arg, *args);
+            walk_list!(vis, visit_type_binding, *bindings);
+        }
+    }
+}
+
+pub fn walk_poly_trait_ref<V: Visitor>(vis: &mut V, trait_ref: &PolyTraitRef) {
+    vis.visit_path(&trait_ref.trait_ref);
+}
+
+pub fn walk_node<V: Visitor>(vis: &mut V, node: &Node) {
+    match node {
+        Node::Item(item) => vis.visit_item(item),
+        Node::TraitItem(trait_item) => vis.visit_trait_item(trait_item),
+        Node::ImplItem(impl_item) => vis.visit_impl_item(impl_item),
+    }
+}
+
+pub fn walk_item<V: Visitor>(vis: &mut V, item: &Item) {
+    match &item.kind {
+        ItemKind::Enum(enum_def) => vis.visit_enum_def(enum_def),
+        ItemKind::Struct(struct_def) => vis.visit_struct_def(struct_def),
+        ItemKind::TyAlias(ty_alias) => vis.visit_ty_alias(ty_alias),
+        ItemKind::Trait(trait_) => {
+            vis.visit_generics(&trait_.generics);
+            walk_list!(vis, visit_trait_assoc_reft, trait_.assoc_refinements);
+        }
+        ItemKind::Impl(impl_) => {
+            vis.visit_generics(&impl_.generics);
+            walk_list!(vis, visit_impl_assoc_reft, impl_.assoc_refinements);
+        }
+        ItemKind::Fn(fn_sig) => {
+            vis.visit_fn_sig(fn_sig);
+        }
+        ItemKind::OpaqueTy(opaque_ty) => {
+            vis.visit_opaque_ty(opaque_ty);
+        }
+    }
+}
+
+pub fn walk_trait_item<V: Visitor>(vis: &mut V, trait_item: &TraitItem) {
+    match &trait_item.kind {
+        TraitItemKind::Fn(fn_sig) => vis.visit_fn_sig(fn_sig),
+        TraitItemKind::Type(assoc_type) => {
+            vis.visit_generics(&assoc_type.generics);
+        }
+    }
+}
+
+pub fn walk_impl_item<V: Visitor>(vis: &mut V, impl_item: &ImplItem) {
+    match &impl_item.kind {
+        ImplItemKind::Fn(fn_sig) => vis.visit_fn_sig(fn_sig),
+        ImplItemKind::Type(assoc_type) => {
+            vis.visit_generics(&assoc_type.generics);
+        }
+    }
+}
+
+pub fn walk_trait_assoc_reft<V: Visitor>(vis: &mut V, assoc_reft: &TraitAssocReft) {
+    walk_list!(vis, visit_refine_param, assoc_reft.params);
+    vis.visit_sort(&assoc_reft.output);
+}
+
+pub fn walk_impl_assoc_reft<V: Visitor>(vis: &mut V, assoc_reft: &ImplAssocReft) {
+    walk_list!(vis, visit_refine_param, assoc_reft.params);
+    vis.visit_sort(&assoc_reft.output);
+    vis.visit_expr(&assoc_reft.body);
+}
+
+pub fn walk_generics<V: Visitor>(vis: &mut V, generics: &Generics) {
+    walk_list!(vis, visit_refine_param, generics.refinement_params);
+    walk_list!(vis, visit_where_predicate, generics.predicates);
+}
+
+pub fn walk_where_predicate<V: Visitor>(vis: &mut V, predicate: &WhereBoundPredicate) {
+    vis.visit_ty(&predicate.bounded_ty);
+    walk_list!(vis, visit_generic_bound, predicate.bounds);
+}
+
 pub fn walk_fn_sig<V: Visitor>(vis: &mut V, sig: &FnSig) {
-    let FnSig { params, requires, args, output, lifted: _, span: _ } = sig;
-    walk_list!(vis, visit_refine_param, params);
-    walk_list!(vis, visit_constraint, requires);
-    walk_list!(vis, visit_ty, args);
-    vis.visit_fn_output(output);
+    vis.visit_fn_decl(sig.decl);
+}
+
+pub fn walk_fn_decl<V: Visitor>(vis: &mut V, decl: &FnDecl) {
+    vis.visit_generics(&decl.generics);
+    walk_list!(vis, visit_constraint, decl.requires);
+    walk_list!(vis, visit_ty, decl.args);
+    vis.visit_fn_output(&decl.output);
 }
 
 pub fn walk_refine_param<V: Visitor>(vis: &mut V, param: &RefineParam) {
-    let RefineParam { ident, sort, kind: _, fhir_id: _ } = param;
-    vis.visit_ident(*ident);
-    vis.visit_sort(sort);
+    vis.visit_sort(&param.sort);
 }
 
 pub fn walk_constraint<V: Visitor>(vis: &mut V, constraint: &Constraint) {
     match constraint {
-        Constraint::Type(loc, ty, _) => {
-            vis.visit_ident(*loc);
+        Constraint::Type(loc, ty) => {
+            vis.visit_path_expr(loc);
             vis.visit_ty(ty);
         }
         Constraint::Pred(p) => vis.visit_expr(p),
@@ -156,10 +323,9 @@ pub fn walk_constraint<V: Visitor>(vis: &mut V, constraint: &Constraint) {
 }
 
 pub fn walk_fn_output<V: Visitor>(vis: &mut V, output: &FnOutput) {
-    let FnOutput { params, ret, ensures } = output;
-    walk_list!(vis, visit_refine_param, params);
-    vis.visit_ty(ret);
-    walk_list!(vis, visit_constraint, ensures);
+    walk_list!(vis, visit_refine_param, output.params);
+    vis.visit_ty(&output.ret);
+    walk_list!(vis, visit_constraint, output.ensures);
 }
 
 pub fn walk_generic_arg<V: Visitor>(vis: &mut V, arg: &GenericArg) {
@@ -170,27 +336,27 @@ pub fn walk_generic_arg<V: Visitor>(vis: &mut V, arg: &GenericArg) {
 }
 
 pub fn walk_ty<V: Visitor>(vis: &mut V, ty: &Ty) {
-    match &ty.kind {
-        TyKind::BaseTy(bty) => vis.visit_bty(bty),
+    match ty.kind {
+        TyKind::BaseTy(bty) => vis.visit_bty(&bty),
         TyKind::Indexed(bty, idx) => {
-            vis.visit_bty(bty);
-            vis.visit_refine_arg(idx);
+            vis.visit_bty(&bty);
+            vis.visit_refine_arg(&idx);
         }
         TyKind::Exists(params, ty) => {
             walk_list!(vis, visit_refine_param, params);
             vis.visit_ty(ty);
         }
         TyKind::Constr(pred, ty) => {
-            vis.visit_expr(pred);
+            vis.visit_expr(&pred);
             vis.visit_ty(ty);
         }
         TyKind::Ptr(lft, loc) => {
-            vis.visit_lifetime(lft);
-            vis.visit_ident(*loc);
+            vis.visit_lifetime(&lft);
+            vis.visit_path_expr(&loc);
         }
         TyKind::Ref(lft, mty) => {
-            vis.visit_lifetime(lft);
-            vis.visit_ty(&mty.ty);
+            vis.visit_lifetime(&lft);
+            vis.visit_ty(mty.ty);
         }
         TyKind::Tuple(tys) => {
             walk_list!(vis, visit_ty, tys);
@@ -223,12 +389,19 @@ pub fn walk_qpath<V: Visitor>(vis: &mut V, qpath: &QPath) {
             if let Some(self_ty) = self_ty {
                 vis.visit_ty(self_ty);
             }
-            let Path { res: _, args, bindings, refine, span: _ } = path;
-            walk_list!(vis, visit_generic_arg, args);
-            walk_list!(vis, visit_type_binding, bindings);
-            walk_list!(vis, visit_refine_arg, refine);
+            vis.visit_path(path);
         }
     }
+}
+
+pub fn walk_path<V: Visitor>(vis: &mut V, path: &Path) {
+    walk_list!(vis, visit_path_segment, path.segments);
+    walk_list!(vis, visit_refine_arg, path.refine);
+}
+
+pub fn walk_path_segment<V: Visitor>(vis: &mut V, segment: &PathSegment) {
+    walk_list!(vis, visit_generic_arg, segment.args);
+    walk_list!(vis, visit_type_binding, segment.bindings);
 }
 
 pub fn walk_type_binding<V: Visitor>(vis: &mut V, binding: &TypeBinding) {
@@ -238,25 +411,14 @@ pub fn walk_type_binding<V: Visitor>(vis: &mut V, binding: &TypeBinding) {
 
 pub fn walk_sort<V: Visitor>(vis: &mut V, sort: &Sort) {
     match sort {
-        Sort::App(_ctor, args) => {
-            walk_list!(vis, visit_sort, args);
-        }
-        Sort::Func(fun) => vis.visit_poly_func_sort(fun),
-        Sort::Record(_def_id, args) => {
-            walk_list!(vis, visit_sort, args);
-        }
-        Sort::BitVec(_)
-        | Sort::Int
-        | Sort::Param(_)
-        | Sort::Var(_)
-        | Sort::Bool
-        | Sort::Real
-        | Sort::Loc
-        | Sort::Unit
-        | Sort::Wildcard
-        | Sort::Infer(_)
-        | Sort::Error => {}
+        Sort::Path(path) => vis.visit_sort_path(path),
+        Sort::Func(func) => vis.visit_poly_func_sort(func),
+        Sort::Loc | Sort::BitVec(_) | Sort::Infer => {}
     }
+}
+
+pub fn walk_sort_path<V: Visitor>(vis: &mut V, path: &SortPath) {
+    walk_list!(vis, visit_sort, path.args);
 }
 
 pub fn walk_poly_func_sort<V: Visitor>(vis: &mut V, func: &PolyFuncSort) {
@@ -265,33 +427,35 @@ pub fn walk_poly_func_sort<V: Visitor>(vis: &mut V, func: &PolyFuncSort) {
 }
 
 pub fn walk_func_sort<V: Visitor>(vis: &mut V, func: &FuncSort) {
-    let FuncSort { inputs_and_output } = func;
-    walk_list!(vis, visit_sort, inputs_and_output);
+    walk_list!(vis, visit_sort, func.inputs_and_output);
 }
 
 pub fn walk_refine_arg<V: Visitor>(vis: &mut V, arg: &RefineArg) {
-    match arg {
-        RefineArg::Expr { expr, is_binder: _ } => vis.visit_expr(expr),
-        RefineArg::Abs(params, body, _span, _fhir_id) => {
+    match arg.kind {
+        RefineArgKind::Expr(expr) => vis.visit_expr(&expr),
+        RefineArgKind::Abs(params, body) => {
             walk_list!(vis, visit_refine_param, params);
-            vis.visit_expr(body);
+            vis.visit_expr(&body);
         }
-        RefineArg::Record(_def_id, vars, args, _span) => {
-            walk_list!(vis, visit_sort, vars);
-            walk_list!(vis, visit_refine_arg, args);
+        RefineArgKind::Record(flds) => {
+            walk_list!(vis, visit_refine_arg, flds);
         }
     }
 }
 
+pub fn walk_alias_pred<V: Visitor>(vis: &mut V, alias: &AliasReft) {
+    vis.visit_ty(alias.qself);
+    vis.visit_path(&alias.path);
+}
+
 pub fn walk_expr<V: Visitor>(vis: &mut V, expr: &Expr) {
-    match &expr.kind {
-        ExprKind::Const(_def_id, _span) => {}
-        ExprKind::Var(var) => vis.visit_ident(*var),
-        ExprKind::Dot(base, _fld) => {
-            vis.visit_ident(*base);
+    match expr.kind {
+        ExprKind::Var(path, _) => vis.visit_path_expr(&path),
+        ExprKind::Dot(path, _fld) => {
+            vis.visit_path_expr(&path);
         }
-        ExprKind::Literal(lit) => vis.visit_literal(lit),
-        ExprKind::BinaryOp(_op, box [e1, e2]) => {
+        ExprKind::Literal(lit) => vis.visit_literal(&lit),
+        ExprKind::BinaryOp(_op, e1, e2) => {
             vis.visit_expr(e1);
             vis.visit_expr(e2);
         }
@@ -299,7 +463,11 @@ pub fn walk_expr<V: Visitor>(vis: &mut V, expr: &Expr) {
         ExprKind::App(_func, args) => {
             walk_list!(vis, visit_expr, args);
         }
-        ExprKind::IfThenElse(box [e1, e2, e3]) => {
+        ExprKind::Alias(alias_pred, args) => {
+            vis.visit_alias_pred(&alias_pred);
+            walk_list!(vis, visit_expr, args);
+        }
+        ExprKind::IfThenElse(e1, e2, e3) => {
             vis.visit_expr(e1);
             vis.visit_expr(e2);
             vis.visit_expr(e3);

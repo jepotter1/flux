@@ -1,9 +1,10 @@
-use flux_errors::{FluxSession, ResultExt};
+use flux_common::result::ResultExt;
+use flux_errors::FluxSession;
 use itertools::Itertools;
 use rustc_borrowck::consumers::BodyWithBorrowckFacts;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def_id::DefId;
-use rustc_infer::traits::Obligation;
+use rustc_infer::{infer::TyCtxtInferExt, traits::Obligation};
 use rustc_middle::{
     mir::{self as rustc_mir, ConstValue},
     traits::{ImplSource, ObligationCause},
@@ -12,7 +13,7 @@ use rustc_middle::{
         TyCtxt, ValTree,
     },
 };
-use rustc_span::Span;
+use rustc_span::{def_id::LocalDefId, Span};
 use rustc_trait_selection::traits::SelectionContext;
 
 use super::{
@@ -45,6 +46,84 @@ pub struct LoweringCtxt<'a, 'sess, 'tcx> {
 #[derive(Debug, Clone)]
 pub struct UnsupportedReason {
     pub(crate) descr: String,
+}
+
+impl UnsupportedReason {
+    fn new(reason: impl ToString) -> Self {
+        UnsupportedReason { descr: reason.to_string() }
+    }
+
+    pub(crate) fn into_err(self) -> UnsupportedErr {
+        UnsupportedErr { descr: self.descr, span: None }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UnsupportedErr {
+    pub descr: String,
+    pub(crate) span: Option<Span>,
+}
+
+impl UnsupportedErr {
+    pub fn new(reason: UnsupportedReason) -> Self {
+        UnsupportedErr { descr: reason.descr, span: None }
+    }
+
+    fn with_span(mut self, span: Span) -> Self {
+        self.span = Some(span);
+        self
+    }
+}
+
+fn trait_ref_impl_id<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    selcx: &mut SelectionContext<'_, 'tcx>,
+    param_env: ParamEnv<'tcx>,
+    trait_ref: rustc_ty::TraitRef<'tcx>,
+) -> Option<(DefId, rustc_middle::ty::GenericArgsRef<'tcx>)> {
+    let obligation = Obligation::new(tcx, ObligationCause::dummy(), param_env, trait_ref);
+    let impl_source = selcx.select(&obligation).ok()??;
+    let impl_source = selcx.infcx.resolve_vars_if_possible(impl_source);
+    let ImplSource::UserDefined(impl_data) = impl_source else {
+        return None;
+    };
+    Some((impl_data.impl_def_id, impl_data.args))
+}
+
+pub fn resolve_trait_ref_impl_id<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: LocalDefId,
+    trait_ref: rustc_ty::TraitRef<'tcx>,
+) -> Option<(DefId, rustc_middle::ty::GenericArgsRef<'tcx>)> {
+    let param_env = tcx.param_env(def_id.to_def_id());
+    let infcx = tcx.infer_ctxt().build();
+    trait_ref_impl_id(tcx, &mut SelectionContext::new(&infcx), param_env, trait_ref)
+}
+
+fn resolve_call_query<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    selcx: &mut SelectionContext<'_, 'tcx>,
+    param_env: ParamEnv<'tcx>,
+    callee_id: DefId,
+    args: rustc_middle::ty::GenericArgsRef<'tcx>,
+) -> Option<(DefId, rustc_middle::ty::GenericArgsRef<'tcx>)> {
+    let trait_id = tcx.trait_of_item(callee_id)?;
+    let trait_ref = rustc_ty::TraitRef::from_method(tcx, trait_id, args);
+    let (impl_def_id, impl_args) = trait_ref_impl_id(tcx, selcx, param_env, trait_ref)?;
+    let assoc_id = tcx.impl_item_implementor_ids(impl_def_id).get(&callee_id)?;
+    let assoc_item = tcx.associated_item(assoc_id);
+    Some((assoc_item.def_id, impl_args))
+}
+
+pub fn resolve_call_from<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    caller_id: LocalDefId,
+    callee_id: DefId,
+    args: rustc_middle::ty::GenericArgsRef<'tcx>,
+) -> Option<(DefId, rustc_middle::ty::GenericArgsRef<'tcx>)> {
+    let param_env = tcx.param_env(caller_id.to_def_id());
+    let infcx = tcx.infer_ctxt().build();
+    resolve_call_query(tcx, &mut SelectionContext::new(&infcx), param_env, callee_id, args)
 }
 
 impl<'sess, 'tcx> LoweringCtxt<'_, 'sess, 'tcx> {
@@ -225,7 +304,7 @@ impl<'sess, 'tcx> LoweringCtxt<'_, 'sess, 'tcx> {
                     args: args
                         .iter()
                         .map(|arg| {
-                            self.lower_operand(arg).map_err(|reason| {
+                            self.lower_operand(&arg.node).map_err(|reason| {
                                 errors::UnsupportedMir::new(span, "terminator args", reason)
                             })
                         })
@@ -306,29 +385,9 @@ impl<'sess, 'tcx> LoweringCtxt<'_, 'sess, 'tcx> {
         callee_id: DefId,
         args: rustc_middle::ty::GenericArgsRef<'tcx>,
     ) -> Result<(DefId, CallArgs<'tcx>), UnsupportedReason> {
-        let tcx = self.tcx;
-        let mut try_resolve = || {
-            if let Some(trait_id) = tcx.trait_of_item(callee_id) {
-                let trait_ref = rustc_ty::TraitRef::from_method(self.tcx, trait_id, args);
-                let obligation =
-                    Obligation::new(self.tcx, ObligationCause::dummy(), self.param_env, trait_ref);
-                let impl_source = self.selcx.select(&obligation).ok()??;
-                let impl_source = self.selcx.infcx.resolve_vars_if_possible(impl_source);
-                let ImplSource::UserDefined(impl_data) = impl_source else { return None };
-
-                let assoc_id = tcx
-                    .impl_item_implementor_ids(impl_data.impl_def_id)
-                    .get(&callee_id)?;
-                let assoc_item = tcx.associated_item(assoc_id);
-
-                Some((assoc_item.def_id, impl_data.args))
-            } else {
-                None
-            }
-        };
-
-        let (resolved_id, resolved_args) = try_resolve().unwrap_or((callee_id, args));
-
+        let (resolved_id, resolved_args) =
+            resolve_call_query(self.tcx, &mut self.selcx, self.param_env, callee_id, args)
+                .unwrap_or((callee_id, args));
         let call_args =
             CallArgs { lowered: lower_generic_args(self.tcx, resolved_args)?, orig: resolved_args };
         Ok((resolved_id, call_args))
@@ -394,7 +453,7 @@ impl<'sess, 'tcx> LoweringCtxt<'_, 'sess, 'tcx> {
         match bk {
             rustc_mir::BorrowKind::Shared => Ok(BorrowKind::Shared),
             rustc_mir::BorrowKind::Mut { kind } => Ok(BorrowKind::Mut { kind }),
-            rustc_mir::BorrowKind::Shallow => {
+            rustc_mir::BorrowKind::Fake => {
                 Err(UnsupportedReason::new(format!("unsupported borrow kind `{bk:?}`")))
             }
         }
@@ -443,11 +502,11 @@ impl<'sess, 'tcx> LoweringCtxt<'_, 'sess, 'tcx> {
                 let args = lower_generic_args(self.tcx, args)?;
                 Ok(AggregateKind::Closure(*did, args))
             }
-            rustc_mir::AggregateKind::Coroutine(did, args, _mov) => {
+            rustc_mir::AggregateKind::Coroutine(did, args) => {
                 let args = lower_generic_args(self.tcx, args)?;
                 Ok(AggregateKind::Coroutine(*did, args))
             }
-            rustc_mir::AggregateKind::Adt(..) => {
+            rustc_mir::AggregateKind::Adt(..) | rustc_mir::AggregateKind::CoroutineClosure(..) => {
                 Err(UnsupportedReason::new(format!(
                     "unsupported aggregate kind `{aggregate_kind:?}`"
                 )))
@@ -478,6 +537,7 @@ impl<'sess, 'tcx> LoweringCtxt<'_, 'sess, 'tcx> {
             | rustc_mir::BinOp::ShlUnchecked
             | rustc_mir::BinOp::ShrUnchecked
             | rustc_mir::BinOp::BitXor
+            | rustc_mir::BinOp::Cmp
             | rustc_mir::BinOp::Offset => {
                 Err(UnsupportedReason::new(format!("unsupported binary op `{bin_op:?}`")))
             }
@@ -558,12 +618,6 @@ pub fn lower_place(place: &rustc_mir::Place) -> Result<Place, UnsupportedReason>
     Ok(Place { local: place.local, projection })
 }
 
-impl UnsupportedReason {
-    fn new(reason: impl ToString) -> Self {
-        UnsupportedReason { descr: reason.to_string() }
-    }
-}
-
 pub(crate) fn lower_fn_sig<'tcx>(
     tcx: TyCtxt<'tcx>,
     fn_sig: rustc_ty::PolyFnSig<'tcx>,
@@ -636,7 +690,7 @@ pub(crate) fn lower_ty<'tcx>(
         rustc_ty::Param(param_ty) => Ok(Ty::mk_param(*param_ty)),
         rustc_ty::Adt(adt_def, args) => {
             let args = lower_generic_args(tcx, args)?;
-            Ok(Ty::mk_adt(lower_adt_def(adt_def), args))
+            Ok(Ty::mk_adt(lower_adt_def(tcx, *adt_def), args))
         }
         rustc_ty::Never => Ok(Ty::mk_never()),
         rustc_ty::Str => Ok(Ty::mk_str()),
@@ -647,10 +701,9 @@ pub(crate) fn lower_ty<'tcx>(
         }
         rustc_ty::Array(ty, len) => Ok(Ty::mk_array(lower_ty(tcx, *ty)?, lower_const(tcx, *len)?)),
         rustc_ty::Slice(ty) => Ok(Ty::mk_slice(lower_ty(tcx, *ty)?)),
-        rustc_ty::RawPtr(t) => {
-            let mutbl = t.mutbl;
-            let ty = lower_ty(tcx, t.ty)?;
-            Ok(Ty::mk_raw_ptr(ty, mutbl))
+        rustc_ty::RawPtr(ty, mutbl) => {
+            let ty = lower_ty(tcx, *ty)?;
+            Ok(Ty::mk_raw_ptr(ty, *mutbl))
         }
         rustc_ty::FnPtr(fn_sig) => {
             let fn_sig = lower_fn_sig(tcx, *fn_sig)?;
@@ -666,7 +719,7 @@ pub(crate) fn lower_ty<'tcx>(
             let args = lower_generic_args(tcx, alias_ty.args)?;
             Ok(Ty::mk_alias(kind, alias_ty.def_id, args))
         }
-        rustc_ty::Coroutine(did, args, _) => {
+        rustc_ty::Coroutine(did, args) => {
             let args = lower_generic_args(tcx, args)?;
             Ok(Ty::mk_coroutine(*did, args))
         }
@@ -686,11 +739,11 @@ fn lower_alias_kind(kind: &rustc_ty::AliasKind) -> Result<AliasKind, Unsupported
     }
 }
 
-pub fn lower_adt_def(adt_def: &rustc_ty::AdtDef) -> AdtDef {
+pub fn lower_adt_def<'tcx>(tcx: TyCtxt<'tcx>, adt_def: rustc_ty::AdtDef<'tcx>) -> AdtDef {
     AdtDef::new(AdtDefData::new(
-        adt_def.did(),
+        tcx,
+        adt_def,
         adt_def.variants().iter().map(lower_variant).collect(),
-        adt_def.flags(),
     ))
 }
 
@@ -706,7 +759,7 @@ fn lower_field(f: &rustc_ty::FieldDef) -> FieldDef {
     FieldDef { did: f.did, name: f.name }
 }
 
-fn lower_generic_args<'tcx>(
+pub fn lower_generic_args<'tcx>(
     tcx: TyCtxt<'tcx>,
     args: rustc_middle::ty::GenericArgsRef<'tcx>,
 ) -> Result<List<GenericArg>, UnsupportedReason> {
@@ -732,12 +785,12 @@ fn lower_region(region: &rustc_middle::ty::Region) -> Result<Region, Unsupported
     use rustc_middle::ty::RegionKind;
     match region.kind() {
         RegionKind::ReVar(rvid) => Ok(Region::ReVar(rvid)),
-        RegionKind::ReLateBound(debruijn, bregion) => {
+        RegionKind::ReBound(debruijn, bregion) => {
             Ok(Region::ReLateBound(debruijn, lower_bound_region(bregion)?))
         }
-        RegionKind::ReEarlyBound(bregion) => Ok(Region::ReEarlyBound(bregion)),
+        RegionKind::ReEarlyParam(bregion) => Ok(Region::ReEarlyBound(bregion)),
         RegionKind::ReStatic => Ok(Region::ReStatic),
-        RegionKind::ReFree(_)
+        RegionKind::ReLateParam(_)
         | RegionKind::RePlaceholder(_)
         | RegionKind::ReError(_)
         | RegionKind::ReErased => {
@@ -752,7 +805,7 @@ fn lower_bound_region(
     Ok(BoundRegion { kind: bregion.kind, var: bregion.var })
 }
 
-pub fn lower_generics(generics: &rustc_ty::Generics) -> Result<Generics, UnsupportedReason> {
+pub(crate) fn lower_generics(generics: &rustc_ty::Generics) -> Result<Generics, UnsupportedReason> {
     let params = List::from_vec(
         generics
             .params
@@ -771,8 +824,8 @@ fn lower_generic_param_def(
             GenericParamDefKind::Type { has_default }
         }
         rustc_ty::GenericParamDefKind::Lifetime => GenericParamDefKind::Lifetime,
-        rustc_ty::GenericParamDefKind::Const { has_default, .. } => {
-            GenericParamDefKind::Const { has_default }
+        rustc_ty::GenericParamDefKind::Const { has_default, is_host_effect } => {
+            GenericParamDefKind::Const { has_default, is_host_effect }
         }
         _ => return Err(UnsupportedReason::new("unsupported generic param")),
     };
@@ -781,85 +834,72 @@ fn lower_generic_param_def(
 
 pub(crate) fn lower_generic_predicates<'tcx>(
     tcx: TyCtxt<'tcx>,
-    sess: &FluxSession,
     generics: rustc_ty::GenericPredicates<'tcx>,
-) -> Result<GenericPredicates, ErrorGuaranteed> {
+) -> Result<GenericPredicates, UnsupportedErr> {
     let predicates = generics
         .predicates
         .iter()
-        .map(|(clause, span)| lower_clause(tcx, sess, clause, *span))
+        .map(|(clause, span)| {
+            lower_clause(tcx, clause).map_err(|reason| UnsupportedErr::new(reason).with_span(*span))
+        })
         .try_collect()?;
     Ok(GenericPredicates { parent: generics.parent, predicates })
 }
 
 pub(crate) fn lower_item_bounds<'tcx>(
     tcx: TyCtxt<'tcx>,
-    sess: &FluxSession,
     bounds: &[rustc_ty::Clause<'tcx>],
-    span: Span,
-) -> Result<List<Clause>, ErrorGuaranteed> {
+) -> Result<List<Clause>, UnsupportedErr> {
     bounds
         .iter()
-        .map(|clause| lower_clause(tcx, sess, clause, span))
+        .map(|clause| lower_clause(tcx, clause).map_err(UnsupportedErr::new))
         .try_collect()
 }
 
 fn lower_clause<'tcx>(
     tcx: TyCtxt<'tcx>,
-    sess: &FluxSession,
     clause: &rustc_ty::Clause<'tcx>,
-    span: Span,
-) -> Result<Clause, ErrorGuaranteed> {
+) -> Result<Clause, UnsupportedReason> {
     let Some(kind) = clause.kind().no_bound_vars() else {
-        return Err(sess.emit_err(errors::UnsupportedGenericBound::new(
-            span,
-            "higher-rank trait bounds are not supported",
-        )));
+        return Err(UnsupportedReason::new("higher-rank trait bounds are not supported"));
     };
     let kind = match kind {
         rustc_ty::ClauseKind::Trait(trait_pred) => {
             ClauseKind::Trait(TraitPredicate {
-                trait_ref: TraitRef {
-                    def_id: trait_pred.trait_ref.def_id,
-                    args: lower_generic_args(tcx, trait_pred.trait_ref.args)
-                        .map_err(|err| errors::UnsupportedGenericBound::new(span, err.descr))
-                        .emit(sess)?,
-                },
+                trait_ref: lower_trait_ref(tcx, trait_pred.trait_ref)?,
             })
         }
         rustc_ty::ClauseKind::Projection(proj_pred) => {
             let Some(term) = proj_pred.term.ty() else {
-                return Err(sess.emit_err(errors::UnsupportedGenericBound::new(
-                    span,
-                    format!("unsupported projection predicate `{proj_pred:?}`"),
+                return Err(UnsupportedReason::new(format!(
+                    "unsupported projection predicate `{proj_pred:?}`"
                 )));
             };
             let proj_ty = proj_pred.projection_ty;
-            let args = lower_generic_args(tcx, proj_ty.args)
-                .map_err(|err| errors::UnsupportedGenericBound::new(span, err.descr))
-                .emit(sess)?;
+            let args = lower_generic_args(tcx, proj_ty.args)?;
 
             let projection_ty = AliasTy { args, def_id: proj_ty.def_id };
-            let term = lower_ty(tcx, term)
-                .map_err(|err| errors::UnsupportedGenericBound::new(span, err.descr))
-                .emit(sess)?;
+            let term = lower_ty(tcx, term)?;
             ClauseKind::Projection(ProjectionPredicate { projection_ty, term })
         }
         rustc_ty::ClauseKind::TypeOutlives(outlives_pred) => {
-            ClauseKind::TypeOutlives(
-                lower_type_outlives(tcx, outlives_pred)
-                    .map_err(|err| errors::UnsupportedGenericBound::new(span, err.descr))
-                    .emit(sess)?,
-            )
+            ClauseKind::TypeOutlives(lower_type_outlives(tcx, outlives_pred)?)
+        }
+        rustc_ty::ClauseKind::ConstArgHasType(const_, ty) => {
+            ClauseKind::ConstArgHasType(lower_const(tcx, const_)?, lower_ty(tcx, ty)?)
         }
         _ => {
-            return Err(sess.emit_err(errors::UnsupportedGenericBound::new(
-                span,
-                format!("unsupported clause kind `{kind:?}`"),
-            )));
+            return Err(UnsupportedReason::new(format!("unsupported clause kind `{kind:?}`")));
         }
     };
     Ok(Clause::new(kind))
+}
+
+pub(crate) fn lower_trait_ref<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    trait_ref: rustc_ty::TraitRef<'tcx>,
+) -> Result<TraitRef, UnsupportedReason> {
+    Ok(TraitRef { def_id: trait_ref.def_id, args: lower_generic_args(tcx, trait_ref.args)? })
 }
 
 fn lower_type_outlives<'tcx>(
@@ -870,6 +910,7 @@ fn lower_type_outlives<'tcx>(
 }
 
 mod errors {
+    use flux_errors::E0999;
     use flux_macros::Diagnostic;
     use rustc_middle::mir as rustc_mir;
     use rustc_span::Span;
@@ -877,7 +918,7 @@ mod errors {
     use super::UnsupportedReason;
 
     #[derive(Diagnostic)]
-    #[diag(middle_unsupported_local_decl, code = "FLUX")]
+    #[diag(middle_unsupported_local_decl, code = E0999)]
     pub(super) struct UnsupportedLocalDecl<'tcx> {
         #[primary_span]
         #[label]
@@ -895,7 +936,7 @@ mod errors {
     }
 
     #[derive(Diagnostic)]
-    #[diag(middle_unsupported_mir, code = "FLUX")]
+    #[diag(middle_unsupported_mir, code = E0999)]
     #[note]
     pub(super) struct UnsupportedMir {
         #[primary_span]
@@ -904,9 +945,9 @@ mod errors {
         reason: UnsupportedReason,
     }
 
-    impl rustc_errors::IntoDiagnosticArg for UnsupportedReason {
-        fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue<'static> {
-            rustc_errors::DiagnosticArgValue::Str(std::borrow::Cow::Owned(self.descr))
+    impl rustc_errors::IntoDiagArg for UnsupportedReason {
+        fn into_diag_arg(self) -> rustc_errors::DiagArgValue {
+            rustc_errors::DiagArgValue::Str(std::borrow::Cow::Owned(self.descr))
         }
     }
 
@@ -939,21 +980,6 @@ mod errors {
                 statement.source_info.span,
                 UnsupportedReason::new(format!("{statement:?}")),
             )
-        }
-    }
-
-    #[derive(Diagnostic)]
-    #[diag(middle_unsupported_generic_bound, code = "FLUX")]
-    #[note]
-    pub struct UnsupportedGenericBound {
-        #[primary_span]
-        span: Span,
-        reason: String,
-    }
-
-    impl UnsupportedGenericBound {
-        pub fn new(span: Span, reason: impl ToString) -> Self {
-            Self { span, reason: reason.to_string() }
         }
     }
 }
